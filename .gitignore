@@ -1,0 +1,13 @@
+# 编译产物
+program_arm
+program_arm.orig
+*.o
+*.elf
+*.bin
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 编辑器/系统
+.vscode/
