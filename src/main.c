@@ -314,7 +314,11 @@ if (mq == (mqd_t)-1) {
     }
     printf("[MAIN] ✅ 全部子系统初始化完成, 进入主循环 (日志: /tmp/program_arm.log, 就绪标记: /tmp/program_arm.ready)\n");
     printf("[MAIN] 当前版本: app923 | 编译时间: %s\n", BUILD_STAMP);
+<<<<<<< HEAD
     pritnf("[MAIN] git main test...\n");
+=======
+    printf("[MAIN] git dev test...\n");
+>>>>>>> dev
 
     // 主循环(等待退出信号)
     while (running)
