@@ -171,65 +171,13 @@ if (range == 0x00) {
 
 
 // [2026-10-13] 每点采样次数: 每次 ADS8691_Read() 内部连续采 N 次取平均, 抑制随机噪声。
+//   实测单次读取仅约 8us(2 帧 SPI @10MHz + 2us 等待), 而每点总耗时约 7.4ms
+//   (主要花在通道切换/回包上), 所以 N=8 仅增加约 67us/点(约 0.9%), 代价可忽略。
 //   噪声按 1/sqrt(N) 下降, N=8 约降 2.8 倍。
-//   [2026-10-22] 改成"一次 ioctl 突发读完", 单点耗时从毫秒级降到微秒级,
-//   N 不再需要为耗时让步, 保持 8 不变(测量结果的口径与旧版完全一致)。
-//   需要更高精度可上调到 16(仍是一次 ioctl, 只多 8 帧 SPI 时钟)。
+//   需要更高精度可上调到 16(约 +134us/点); 设为 1 即退回原来的单次读取行为。
 #define ADS8691_AVG_N   8
 
-// 每帧 4 字节, 帧间要等转换完成: tCONV ≈ 665ns, 留 2us 余量。
-// 交给内核 delay_usecs 做 udelay(微秒精度), 不再用 usleep(2)
-// —— usleep 的实际粒度是"至少一个调度节拍"(实测 50~60us), N=8 时白等 0.5ms。
-#define ADS8691_CONV_WAIT_US  2
-#define ADS8691_BURST_MAX     (ADS8691_AVG_N + 1)   // +1 = 丢弃的首帧
-
-// ==================== 一次 ioctl 连读 n 帧 ====================
-// ADS8691 的 SDO 输出的是"上一次转换结果", 每帧传输结束的 CS 上升沿才启动下一次转换。
-// 因此这里把 n 帧放进同一条 SPI_IOC_MESSAGE(n):
-//   - tr[i].cs_change = 1 (非最后一帧): 该帧传完内核就释放 CS -> 上升沿启动转换;
-//   - tr[i].delay_usecs = 2           : 给 tCONV 留时间, 下一帧读到的才是新结果;
-// 相比原来"每帧一次 ioctl + usleep(2)", 系统调用从 2n 次降到 1 次。
-// 返回: 0 成功(out[0..n-1] 为 18 位码值); -1 失败
-static int ads8691_read_burst(uint32_t *out, int n)
-{
-    uint8_t tx[ADS8691_BURST_MAX][4];
-    uint8_t rx[ADS8691_BURST_MAX][4];
-    struct spi_ioc_transfer tr[ADS8691_BURST_MAX];
-
-    if (out == NULL || n < 1 || n > ADS8691_BURST_MAX) {
-        return -1;
-    }
-
-    memset(tx, 0, sizeof(tx));
-    memset(rx, 0, sizeof(rx));
-    memset(tr, 0, sizeof(tr));
-
-    for (int i = 0; i < n; i++) {
-        int last = (i == n - 1);
-        tr[i].tx_buf        = (unsigned long)tx[i];   // 读数据帧, MOSI 保持 0
-        tr[i].rx_buf        = (unsigned long)rx[i];
-        tr[i].len           = 4;
-        tr[i].speed_hz      = ADS8691_SPI_SPEED;
-        tr[i].bits_per_word = 8;
-        tr[i].cs_change     = last ? 0 : 1;           // 非最后一帧: 传完释放 CS
-        tr[i].delay_usecs   = last ? 0 : ADS8691_CONV_WAIT_US;
-    }
-
-    if (spi_transfer_msgs(g_spi, tr, n) < 0) {
-        return -1;
-    }
-
-    for (int i = 0; i < n; i++) {
-        uint32_t raw = ((uint32_t)rx[i][0] << 24) |
-                       ((uint32_t)rx[i][1] << 16) |
-                       ((uint32_t)rx[i][2] << 8) |
-                       (uint32_t)rx[i][3];
-        out[i] = (raw >> 14) & 0x3FFFF;
-    }
-    return 0;
-}
-
-// 单次读取(内部使用, 仅作批量路径失败时的回退): 双读同步, 丢弃第 1 帧
+// 单次读取(内部使用): 双读同步, 丢弃第 1 帧
 static uint32_t ads8691_read_once(void)
 {
     uint8_t tx_buf[4] = {0, 0, 0, 0};
@@ -271,25 +219,10 @@ uint32_t ADS8691_Read(void) {
         }
     }
 
-    // [2026-10-22] 快路径: 1 + N 帧一次 ioctl 读完。
-    //   第 0 帧丢弃(它的值来自切换通道之前的那次转换), 第 1..N 帧才是当前通道的新数据;
-    //   与旧实现"丢首帧 + N 次采样平均"在数学上完全等价, 只是省掉了 2N 次系统调用。
-    uint32_t buf[ADS8691_BURST_MAX];
-    if (ads8691_read_burst(buf, ADS8691_AVG_N + 1) == 0) {
-        uint32_t sum = 0;
-        for (int i = 1; i <= ADS8691_AVG_N; i++) {
-            sum += buf[i];
-        }
-        return (sum + ADS8691_AVG_N / 2) / ADS8691_AVG_N;   // 四舍五入
-    }
-
-    // ---- 回退路径: 内核/驱动不支持批量帧(或偶发传输失败)时用原来的逐帧方式 ----
-    // (只提示一次, 避免驱动不支持时每点刷一行)
-    static int burst_warned = 0;
-    if (!burst_warned) {
-        burst_warned = 1;
-        printf("[ADS8691] ⚠️ 批量读取失败, 回退逐帧读取(本提示只打一次)\n");
-    }
+    // [2026-10-13] 多次采样取平均 + 丢弃失败样本:
+    //   ① 平均 -> 抑制随机噪声(1/sqrt(N))
+    //   ② 失败样本(0xFFFFFFFF)不参与, 全部失败才返回错误
+    //      这样即使偶发 SPI 抖动, 也不会让上层拿到 -12.28V 这样的假值
     uint32_t sum = 0;
     uint32_t n = 0;
     for (int a = 0; a < ADS8691_AVG_N; a++) {

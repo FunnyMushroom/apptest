@@ -954,22 +954,13 @@ void Task_Set_Scan_Channels(void *arg) {
 //   被测节点为容性+高阻源, 空闲期间被激励经被测件慢慢充高; 开始采样后测量通路
 //   把节点拉回平衡点(实测 τ≈2s, 1.5V→0.44V 平台)。不丢弃的话, 隔久了的第一次
 //   扫描会看到整条衰减曲线(实测 10 次约出现 1~2 次)。
-//   策略: 每块求块均值, 相邻块均值差 < SCAN_SETTLE_DIFF_LSB 视为已稳定;
-//   有弛豫时按上限强制开采。
-//   [2026-10-22] 判据从"点数"改为"时间":
-//     原来按 20 点/块、350 点上限(隐含假设 ~5.7ms/点)。ADS8691 读取改为一次 ioctl
-//     突发读完(见 ads8691.c)后单点耗时降到亚毫秒, 若继续按点数算:
-//       - 20 点一块只跨 ~6ms, 块均值几乎抵消不了噪声, 容易被"假稳定"骗过;
-//       - 350 点上限只有 ~0.1s, 慢弛豫节点根本等不到稳, 会采到衰减曲线。
-//     因此改成: 块 = 至少 SCAN_SETTLE_BLOCK_MIN 点 且 跨度 ≥ SCAN_SETTLE_BLOCK_MS;
-//               上限 = SCAN_SETTLE_MAX_MS。与原设计 (0.11s 块 / 2s 窗口) 在时间域等价,
-//               判据(150 LSB ≈ 14mV)保持不变 —— 测量稳定性不受提速影响。
-#define SCAN_SETTLE_BLOCK_MS     80     // 块跨度(ms), 与原 20 点×~5.4ms 相当
-#define SCAN_SETTLE_BLOCK_MIN    8      // 块内最少点数(防止极端快的机器上块太瘦)
+//   策略: 每 SCAN_SETTLE_BLOCK 点求块均值, 相邻块均值差 < SCAN_SETTLE_DIFF_LSB
+//   视为已稳定(节点已稳时约 0.4s 通过; 有弛豫时按上限强制开采)。
+//   [2026-10-16] 上限从 1000 点(≈5.7s)降到 350 点(≈2.0s, 实测约 5.7ms/点):
+//   用户反馈"等待太久", 但保留 2 秒确保慢弛豫节点也能等稳。
+#define SCAN_SETTLE_BLOCK        20     // 块大小(点), ~0.11s
 #define SCAN_SETTLE_DIFF_LSB     150    // 稳定判据: 相邻块均值差 < 150 LSB(≈14mV)
-#define SCAN_SETTLE_MAX_MS       2000   // 丢弃上限(2s), 超时强制进入正式采样
-#define SCAN_SETTLE_REPORT_MS    500    // 丢弃期进度打印间隔
-#define SCAN_SWITCH_SETTLE_US    2000   // 切完通道后的模拟通路建立等待
+#define SCAN_SETTLE_MAX_POINTS   350    // 丢弃上限(~2.0s), 超时强制进入正式采样
 
 // ==================== 自动 ADC 采集 ====================
 // 从队列取通道, 每通道采 Times_Read_ADC121 次(0x1B 设置), 发送原始数据
@@ -985,7 +976,6 @@ void Task_ADC_Auto_Scan(void *arg) {
 
     uint32_t total_reads = 0;
     int samples_per_ch = Times_Read_ADC121;
-    long long t_scan0 = task_now_us();   // 整体耗时/吞吐统计用
 
     // 先把队列快照到本地, 加锁区间尽量短:
     //   1. 扫描过程中不再持有队列锁, 不会阻塞 SelChannel/SetScanChannels;
@@ -1037,50 +1027,28 @@ void Task_ADC_Auto_Scan(void *arg) {
         // [2026-10-13] 通道切换后留稳定时间: 继电器/模拟开关切换后, 信号通路需要
         //   建立时间, 此前"切完立刻采"会把切换瞬态当成读数(每通道首个点尤其明显)。
         //   代价: 每通道 +2ms。多点扫描时每通道只切换一次, 总耗时影响可忽略。
-        usleep(SCAN_SWITCH_SETTLE_US);
+        usleep(2000);
 
         // [2026-10-15] 弛豫丢弃(自适应, 不回包不计数):
-        //   [2026-10-22] 改为按时间分块/限时(见文件上方宏说明), 并支持 0x21 中途打断。
+        //   每 SCAN_SETTLE_BLOCK 点求块均值, 相邻块差 < SCAN_SETTLE_DIFF_LSB 判稳定;
         //   SPI 失败样本不计入块均值但计入总量, 保证必然终止。
         {
-            long long t_settle0 = task_now_us();
-            long long t_block0  = t_settle0;
-            long long t_report  = t_settle0;
-            uint64_t block_sum = 0;      // 64 位累加: 单点极快时一块可能有上千点, 防溢出
-            uint32_t prev_avg = 0;
+            uint32_t block_sum = 0, prev_avg = 0;
             int in_block = 0, blocks = 0, settled = 0, dropped = 0;
-
-            while (!atomic_load(&adc_stop_flag)) {
-                long long now = task_now_us();
-                if (now - t_settle0 >= (long long)SCAN_SETTLE_MAX_MS * 1000) {
-                    break;                      // 丢弃上限到, 强制开采
-                }
-
+            while (dropped < SCAN_SETTLE_MAX_POINTS) {
                 uint32_t v = ADS8691_Read();
                 dropped++;
-                if (v == 0xFFFFFFFF) continue;  // SPI 失败: 不进块均值
-
+                // [2026-10-16] 丢弃期进度打印: 每 50 点一行, 避免这段时间"像卡住"
+                if (dropped % 50 == 0) {
+                    printf("[AutoScan]   通道 %u: 弛豫中, 已丢 %d/%d 点, 最新 ADC=%u\n",
+                           ch_info.collect, dropped, SCAN_SETTLE_MAX_POINTS, v);
+                }
+                if (v == 0xFFFFFFFF) continue;   // SPI 失败: 不进块均值
                 block_sum += v;
-                in_block++;
-
-                long long now2 = task_now_us();
-                // 丢弃期进度打印: 按时间(默认 500ms 一行), 避免这段时间"像卡住"
-                if (now2 - t_report >= (long long)SCAN_SETTLE_REPORT_MS * 1000) {
-                    t_report = now2;
-                    printf("[AutoScan]   通道 %u: 弛豫中, 已丢 %d 点(%.2fs), 最新 ADC=%u\n",
-                           ch_info.collect, dropped,
-                           (double)(now2 - t_settle0) / 1e6, v);
-                }
-
-                if (in_block < SCAN_SETTLE_BLOCK_MIN ||
-                    (now2 - t_block0) < (long long)SCAN_SETTLE_BLOCK_MS * 1000) {
-                    continue;                   // 本块还没攒够(点数 + 时间都满足才算一块)
-                }
-
-                uint32_t avg = (uint32_t)(block_sum / (uint64_t)in_block);
+                if (++in_block < SCAN_SETTLE_BLOCK) continue;
+                uint32_t avg = block_sum / SCAN_SETTLE_BLOCK;
                 block_sum = 0;
                 in_block = 0;
-                t_block0 = now2;
                 blocks++;
                 if (blocks >= 2) {
                     uint32_t d = (avg > prev_avg) ? (avg - prev_avg) : (prev_avg - avg);
@@ -1161,14 +1129,7 @@ void Task_ADC_Auto_Scan(void *arg) {
     }
 
     atomic_store(&adc_stop_flag, 1);
-    {
-        // [2026-10-22] 吞吐统计: 提速前后可直接对比 "耗时 / 点每秒"
-        double sec = (double)(task_now_us() - t_scan0) / 1e6;
-        printf("[AutoScan] ✅ 任务完成: 共采集 %u 次, 耗时 %.3fs (%.1f 点/秒, 单点 %.3fms)\n",
-               total_reads, sec,
-               sec > 0 ? (double)total_reads / sec : 0.0,
-               total_reads > 0 ? sec * 1000.0 / (double)total_reads : 0.0);
-    }
+    printf("[AutoScan] ✅ 任务完成: 共采集 %u 次\n", total_reads);
     // [2026-10-15] 撤销扫描结束关断(原 [2026-10-09] 加的 disable_all_switch_via_cpld()
     //   + disable_all_switch()): 实测关断后被测节点失源, 电压从激励值指数缓降
     //   (τ≈2s, 1.58V->0.43V 平台), 而 ceshi_920 旧版扫描结束不关激励、CPLD 锁存

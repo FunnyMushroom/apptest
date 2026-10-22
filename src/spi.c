@@ -158,32 +158,6 @@ int spi_transfer(spi_t *spi, const unsigned char *tx_data, int tx_len, unsigned 
     return len;
 }
 
-// ==================== 批量帧: 一次 ioctl 下发 n 个 SPI 消息 ====================
-int spi_transfer_msgs(spi_t *spi, struct spi_ioc_transfer *tr, int n) {
-    if (spi == NULL || !spi->is_open || spi->fd < 0) {
-        printf("[SPI] ❌ 批量传输失败: 句柄无效(未初始化或已关闭)\n");
-        return -1;
-    }
-    if (tr == NULL || n <= 0) {
-        printf("[SPI] ❌ 批量传输失败: 参数无效(tr=%p, n=%d)\n", (void *)tr, n);
-        return -1;
-    }
-
-    // 未显式指定的字段在此补齐, 避免调用方漏填 bits_per_word 时被内核按 8 位默认值处理出错
-    for (int i = 0; i < n; i++) {
-        if (tr[i].speed_hz == 0)         tr[i].speed_hz = (uint32_t)spi->speed_hz;
-        if (tr[i].bits_per_word == 0)    tr[i].bits_per_word = (uint8_t)spi->bits_per_word;
-    }
-
-    // SPI_IOC_MESSAGE(n): n 个消息在同一个 ioctl 内完成, 只有一次系统调用/一次内核入口
-    int ret = ioctl(spi->fd, SPI_IOC_MESSAGE(n), tr);
-    if (ret < 0) {
-        printf("[SPI] ❌ 批量传输失败: n=%d: %s\n", n, strerror(errno));
-        return -1;
-    }
-    return ret;
-}
-
 int spi_recv(spi_t *spi, unsigned char *buffer, int len) {
     if (spi == NULL || !spi->is_open || spi->fd < 0) {
         printf("[SPI] ❌ 接收失败: 句柄无效(未初始化或已关闭)\n");

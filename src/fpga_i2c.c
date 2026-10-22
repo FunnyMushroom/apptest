@@ -102,22 +102,16 @@ static void fpga_i2c_unlock(void) {
 
 // 带状态提示的寄存器写：写失败时明确打印（直接调 i2c_write_byte 时返回值常被忽略）
 // 注意: 本函数在采集/扫描循环里会被高频调用, 因此成功时刻意不打印, 避免刷屏
-// [2026-10-22] 增加 delay_us 版本: 扫描时切通道要连写 2 个寄存器, 用默认 1ms/次
-//   会白等 2ms/通道; 这里让高频路径自己指定(200us 足够从机锁存)。
-static int fpga_write_byte_ex(i2c_t *fpga, uint8_t reg, uint8_t val, unsigned int delay_us) {
+static int fpga_write_byte(i2c_t *fpga, uint8_t reg, uint8_t val) {
     if (fpga == NULL) {
         printf("[FPGA] ❌ 写寄存器失败: I2C 句柄为 NULL (reg=0x%02X val=0x%02X)\n", reg, val);
         return -1;
     }
-    if (i2c_write_byte_ex(fpga, reg, val, delay_us) != 0) {
+    if (i2c_write_byte(fpga, reg, val) != 0) {
         printf("[FPGA] ❌ 写寄存器失败: 0x%02X=0x%02X\n", reg, val);
         return -1;
     }
     return 0;
-}
-
-static int fpga_write_byte(i2c_t *fpga, uint8_t reg, uint8_t val) {
-    return fpga_write_byte_ex(fpga, reg, val, 1000);
 }
 
 
@@ -642,9 +636,7 @@ uint16_t Select_Collect_Card_Channel_HV(uint16_t num) {
         (unsigned)num1, val, (unsigned)num2, val2);
 
     // 写入新值
-    // [2026-10-22] 扫描热路径: 两个寄存器连写, 用 200us 锁存等待代替默认 1ms/次,
-    //   单通道省 1.6ms。切完通道后的模拟建立时间由调用方(扫描任务)统一等待。
-    if (fpga_write_byte_ex(fpga1, 0x05, val, 200) != 0) {
+    if (fpga_write_byte(fpga1, 0x05, val) != 0) {
         fpga_i2c_unlock();
         printf("[Select_Collect_Card_Channel_HV] ❌ 选择失败: 写寄存器 0x05=0x%02X 出错\n", val);
         return 0xFF;
@@ -652,7 +644,7 @@ uint16_t Select_Collect_Card_Channel_HV(uint16_t num) {
     long long t_w05 = fpga_now_us();
 
     // 写入新值
-    if (fpga_write_byte_ex(fpga1, 0x06, val2, 200) != 0) {
+    if (fpga_write_byte(fpga1, 0x06, val2) != 0) {
         fpga_i2c_unlock();
         printf("[Select_Collect_Card_Channel_HV] ❌ 选择失败: 写寄存器 0x06=0x%02X 出错\n", val2);
         return 0xFF;
