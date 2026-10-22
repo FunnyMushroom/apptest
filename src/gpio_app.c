@@ -175,8 +175,6 @@ int pd1415_low(void) {
     gpio_close(g14);
     gpio_close(g15);
     printf("[pd1415] ✅ PD14(110)/PD15(111) 已恢复低电平\n");
-    
-
     return 0;
 }
 int disable_all_switch(void) {

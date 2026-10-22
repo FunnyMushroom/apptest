@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/ioctl.h>
 #include <linux/spi/spidev.h>
 
@@ -50,6 +51,18 @@ spi_t *spi_init(const char *device, int mode, int speed_hz);
 int spi_send(spi_t *spi, const unsigned char *data, int len);
 int spi_transfer(spi_t *spi, const unsigned char *tx_data, int tx_len, unsigned char *rx_data, int rx_len);
 int spi_recv(spi_t *spi, unsigned char *buffer, int len);
+
+// ==================== 批量帧(一次 ioctl 发 n 个 SPI 消息) ====================
+// [2026-10-22] 用途: ADS8691 每点要连读多帧(每帧结束的 CS 上升沿启动下一次转换)。
+//   原来每帧一次 ioctl + 一次 usleep, 实测 spidev 单次 ioctl 开销可达数百微秒,
+//   一次采样的 16 次 ioctl 就吃掉 5ms 以上 —— 采样慢的主因是系统调用而不是 SPI 时钟。
+//   改成把 n 帧放进同一条 SPI_IOC_MESSAGE(n) 里:
+//     - 帧间由 tr[i].cs_change=1 让内核释放 CS(产生上升沿 -> 启动转换);
+//     - 帧间延时用 tr[i].delay_usecs 交给内核 udelay(微秒级, 不经过调度器);
+//   调用方自行填好每个 tr 元素的 tx_buf/rx_buf/len/cs_change/delay_usecs。
+// 返回: >=0 成功(实际传输的字节数); -1 失败
+int spi_transfer_msgs(spi_t *spi, struct spi_ioc_transfer *tr, int n);
+
 void spi_close(spi_t *spi);
 
 #endif 
