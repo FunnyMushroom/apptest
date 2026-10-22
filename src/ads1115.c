@@ -45,7 +45,7 @@ static i2c_t *ads1115_i2c_get(void) {
         printf("[ADS1115] ❌ I2C 总线打开失败: %s, 从机地址 0x%02X\n",
                ADS1115_I2C_DEVICE, ADS1115_ADDR);
     } else {
-        printf("[ADS1115] ✅  总线已建立(全局复用): %s, 从机地址 0x%02X, fd=%d\n",
+        printf("[ADS1115] ✅ I2C 总线已建立(全局复用): %s, 从机地址 0x%02X, fd=%d\n",
                g_i2c->device, g_i2c->addr, g_i2c->fd);
     }
     return g_i2c;
