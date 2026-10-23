@@ -30,7 +30,7 @@ static int gpio_write_once(int pin, gpio_value_t value) {
     return r;
 }
 
-
+_Atomic int g_gpio_app_inited = 0;
 
 
 

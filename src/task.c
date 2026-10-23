@@ -25,6 +25,7 @@
 #include "realtime.h"
 #include <mqueue.h>
 #include <time.h>
+#include <pthread.h>
 #include <gpio_app.h>
 
 // [2026-10-13] SD 卡功能已整体移除
@@ -962,6 +963,145 @@ void Task_Set_Scan_Channels(void *arg) {
 #define SCAN_SETTLE_DIFF_LSB     150    // 稳定判据: 相邻块均值差 < 150 LSB(≈14mV)
 #define SCAN_SETTLE_MAX_POINTS   350    // 丢弃上限(~2.0s), 超时强制进入正式采样
 
+// ==================== PD14/PD15 同步脉冲(异步执行) ====================
+// [2026-10-23 修复 连续多通道扫描丢包]
+//   原实现: 扫描任务在发完 0x1E 结束帧之后, 自己 usleep(1s) 等 PD14/PD15 脉冲
+//           结束再拉低, 然后才 return。
+//   问题:   0x1D 的"单飞占用"标记(g_opcode_busy)要等任务函数 return 之后,
+//           才由 protocol.c 的 exec_wrapper() 调用 opcode_release() 释放。
+//           于是每次扫描结束后, 0x1D 还要再"忙"整整 1 秒。
+//   现场现象: 上位机连续扫多个不同通道时, 收到 0x1E 结束帧后立刻发下一条 0x1D,
+//           正好落在这 1 秒窗口内 -> 被 dispatch_task() 判为"重复指令"丢弃,
+//           回 0xF1(错误码 0x1D00 = "当前操作忙"), 且一条 0x1E 数据都不发。
+//   修法:   把"拉高保持 N 毫秒再拉低"挪到独立的一次性线程里, 扫描任务发完
+//           结束帧立即 return, 0x1D 随即释放, 忙窗口只剩收尾的几十微秒。
+//   ⚠️ [2026-10-23 二次修复] 异步化之后暴露了硬件耦合:
+//   实测(2026_10_23_scan.log)每一次扫描, 数据从 ~0V 跳到正确值的时刻, 都精确等于
+//   "pd1415 恢复低电平"的时刻, 例如:
+//       00:08:25.371 第111次 ADC=131095 (0.002V)
+//       00:08:25.401 PD14/PD15 已恢复低电平     <- 同一时刻
+//       00:08:25.437 第121次 ADC=155172 (2.259V)
+//   即: **PD14/PD15 为高电平时, ADS8691 读到的是 ~0V 无效值**(疑似该引脚驱动了
+//   放电/复用/切换回路, 把测量通路拉到地)。旧代码因为要在任务里 sleep 1s 等脉冲
+//   结束才 return, 下一次扫描必然已经在脉冲之后, 所以掩盖了这个耦合;
+//   异步化后下一次扫描可以抢在脉冲结束前开始 -> 前约 0.9 秒(前 ~100~120 点)全是
+//   0V 垃圾值, 正是用户反馈的"之后扫描的数据前 100 次异常"。
+//   修法: 新扫描开始前调用 pd1415_pulse_cancel(), 打断尚未走完的脉冲并立即拉低,
+//   保证整个采集过程中 PD14/PD15 恒为低。代价: 连续扫描时同步脉冲会被截断,
+//   这是"不忙 1 秒"与"采到有效数据"二者不可兼得的必然取舍。
+#define PD1415_PULSE_MS   1000          // 同步脉冲高电平保持时间(ms)
+
+static pthread_mutex_t g_pd1415_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long   g_pd1415_seq  = 0;   // 脉冲序号: 只有最新一条脉冲线程有权拉低
+static int             g_pd1415_high_now = 0;  // 当前是否正处于脉冲高电平
+
+static void *pd1415_pulse_worker(void *arg) {
+    unsigned long my_seq = (unsigned long)(uintptr_t)arg;
+
+    usleep(PD1415_PULSE_MS * 1000);
+
+    pthread_mutex_lock(&g_pd1415_lock);
+    int mine = (my_seq == g_pd1415_seq) && g_pd1415_high_now;
+    if (mine) g_pd1415_high_now = 0;
+    unsigned long cur_seq = g_pd1415_seq;
+    pthread_mutex_unlock(&g_pd1415_lock);
+
+    if (mine) {
+        pd1415_low();   // 只有最新且未被打断的脉冲负责收尾
+    } else {
+        // 被新扫描打断, 或已被更新的脉冲接管: 老线程不能再拉低(否则会把新脉冲截短)
+        printf("[pd1415]   跳过拉低: 脉冲已失效(当前序号=%lu, 本线程=%lu)\n",
+               cur_seq, my_seq);
+    }
+    return NULL;
+}
+
+// 触发一次"拉高 -> 保持 PD1415_PULSE_MS 毫秒 -> 拉低"的同步脉冲, 不阻塞调用者
+static int pd1415_pulse_async(void) {
+    pthread_t tid;
+    unsigned long seq;
+    int rc;
+
+    // 置位与拉高在同一把锁内完成, 避免与 pd1415_pulse_cancel() 交错
+    // (否则可能出现"cancel 先拉低、随后这里才拉高"的漏网窗口)
+    pthread_mutex_lock(&g_pd1415_lock);
+    seq = ++g_pd1415_seq;
+    g_pd1415_high_now = 1;
+    rc = pd1415_high();
+    pthread_mutex_unlock(&g_pd1415_lock);
+
+    if (rc != 0) {
+        pthread_mutex_lock(&g_pd1415_lock);
+        g_pd1415_high_now = 0;
+        pthread_mutex_unlock(&g_pd1415_lock);
+        printf("[pd1415] ❌ 脉冲触发失败: PD14/PD15 置高失败\n");
+        return -1;
+    }
+
+    if (pthread_create(&tid, NULL, pd1415_pulse_worker,
+                       (void *)(uintptr_t)seq) != 0) {
+        printf("[pd1415] ❌ 脉冲线程创建失败, 立即拉低兜底\n");
+        pthread_mutex_lock(&g_pd1415_lock);
+        g_pd1415_high_now = 0;
+        pd1415_low();
+        pthread_mutex_unlock(&g_pd1415_lock);
+        return -1;
+    }
+    pthread_detach(tid);
+    printf("[pd1415] ▶ 已启动异步脉冲(序号=%lu, 高电平 %d ms 后自动拉低)\n",
+           seq, PD1415_PULSE_MS);
+    return 0;
+}
+
+// 打断尚未结束的同步脉冲: 立即拉低, 并让挂起的脉冲线程失效。
+// 必须在每次扫描开始前调用 —— 采集期间 PD14/PD15 为高会把 ADC 读数压到 ~0V。
+static void pd1415_pulse_cancel(void) {
+    pthread_mutex_lock(&g_pd1415_lock);
+    int was_high = g_pd1415_high_now;
+    g_pd1415_high_now = 0;
+    g_pd1415_seq++;                 // 让挂起线程到点后不再拉低(它已过期)
+    if (was_high) {
+        pd1415_low();
+    }
+    pthread_mutex_unlock(&g_pd1415_lock);
+
+    if (was_high) {
+        printf("[pd1415] ⚠️ 已打断未结束的同步脉冲: "
+               "采集期间 PD14/PD15 必须保持低电平(高电平时 ADC 读数为 ~0V)\n");
+    }
+}
+
+// ==================== 扫描收尾: 关闭全部开关通道 ====================
+// [2026-10-23]  自动扫描(0x1D)结束后关闭所有通道, 断开输出回路,
+//   使示波器测量时不再有开关切换 / 激励残留波形。
+//
+// ⚠️ 与 [2026-10-15] 的决议相反: 当时发现关断后被扫节点失源, 电压从激励值
+//   指数缓降(τ≈2s, 1.58V->0.43V 平台), 为此撤销过扫描结束关断、恢复"激励保持"。
+//   本次是按当前需求重新开启。若后续需要保压, 把下面的
+//   SCAN_DISABLE_ALL_ON_DONE 改成 0 即可一键回退, 不必再翻历史提交。
+#ifndef SCAN_DISABLE_ALL_ON_DONE
+#define SCAN_DISABLE_ALL_ON_DONE   1
+#endif
+
+// reason: 调用原因, 仅用于日志区分"正常扫完"与"被 0x21 中断"
+static void scan_disable_all_switch(const char *reason) {
+#if SCAN_DISABLE_ALL_ON_DONE
+    printf("[AutoScan] ▶ 收尾: 关闭全部开关通道(%s)\n", reason);
+
+    // 1) CPLD 广播: 向 0x00~0x0F 全部 16 个卡地址发 CH=0, 断开各卡已选通道
+    int r1 = disable_all_switch_via_cpld();
+    // 2) GPIO: PA11 / PB0 拉低, 释放 0-7 / 8-15 两组地址锁存
+    //    (内部还会补发一帧 CPLD 0x00 0x00)
+    int r2 = disable_all_switch();
+
+    printf("[AutoScan] %s 全部开关通道已关闭(cpld_ret=%d, gpio_ret=%d), 输出端已静默\n",
+           (r1 == 0 && r2 == 0) ? "✅" : "⚠️", r1, r2);
+#else
+    (void)reason;
+    printf("[AutoScan]   跳过关闭通道: SCAN_DISABLE_ALL_ON_DONE=0(保压模式)\n");
+#endif
+}
+
 // ==================== 自动 ADC 采集 ====================
 // 从队列取通道, 每通道采 Times_Read_ADC121 次(0x1B 设置), 发送原始数据
 void Task_ADC_Auto_Scan(void *arg) {
@@ -971,6 +1111,11 @@ void Task_ADC_Auto_Scan(void *arg) {
     // 打印：任务开始
     printf("[AutoScan] ▶ 任务开始: 自动 ADC 扫描, 每通道采样=%d 次\n", Times_Read_ADC121);
  atomic_store(&HV_stop_flag, 0);
+
+    // [2026-10-23] 采集前必须先确保 PD14/PD15 为低: 上一次扫描结束时的 1 秒同步
+    // 脉冲可能还没走完, 而该引脚为高会把 ADS8691 的读数压到 ~0V(实测), 导致本次
+    // 扫描前 ~100 个点全是垃圾值。这里打断未结束的脉冲并立即拉低。
+    pd1415_pulse_cancel();
 
     atomic_store(&adc_stop_flag, 0);
 
@@ -1011,10 +1156,19 @@ void Task_ADC_Auto_Scan(void *arg) {
             //  cpld_send_hex_command_block(0x03,0x07);
             // [2026-10-13] 检查切通道结果: 原来忽略返回值, CPLD 超时(内部重发 4 次仍失败,
             //   返回 -2)时仍继续往下采, 等于把"开关卡没切过去"的值当成该通道数据 -> 数据错乱。
+            // [2026-10-23] 整通道级重试 1 次: 连续扫多通道时, 若 485 总线正被别的
+            //   命令占用(内部 4 次重发都撞上), 原来会直接跳过该通道 -> 上位机一直
+            //   等这一通道的 0x1E 等不到。这里隔 20ms 再试一次, 仍失败才跳过。
             int cpld_ret = cpld_send_hex_command_wait_reply(card, channel, echo);  // 0=成功
             if (cpld_ret != 0) {
-                printf("[adc自动扫描] ⚠️ 开关卡切通道失败(card=%d, ch=%d, ret=%d), 跳过该通道\n",
+                printf("[adc自动扫描] ⚠️ 开关卡切通道失败(card=%d, ch=%d, ret=%d), 20ms 后重试一次\n",
                        card, channel, cpld_ret);
+                usleep(20 * 1000);
+                cpld_ret = cpld_send_hex_command_wait_reply(card, channel, echo);
+            }
+            if (cpld_ret != 0) {
+                printf("[adc自动扫描] ❌ 开关卡切通道重试仍失败(card=%d, ch=%d, ret=%d), "
+                       "跳过该通道(本通道不会回 0x1E)\n", card, channel, cpld_ret);
                 continue;
             }
             // usleep(1000*1000);
@@ -1122,28 +1276,34 @@ void Task_ADC_Auto_Scan(void *arg) {
     int aborted = atomic_load(&adc_stop_flag);
 
     if (aborted) {
-        pd1415_low();
+        // 中断时同样要打断可能挂着的脉冲(可能是上一次扫描留下的)
+        pd1415_pulse_cancel();
         printf("[AutoScan] ⚠️ 采集被中断, PD14/PD15 保持低电平(不脉冲)\n");
     } else {
-        pd1415_high();
+        // [2026-10-23] 异步脉冲: 立刻返回, 不再让 0x1D 多"忙" 1 秒
+        // (原实现在这里 pd1415_high() + 末尾 usleep(1s) + pd1415_low(),
+        //  把 0x1D 的占用标记一直拖到脉冲结束才释放)
+        pd1415_pulse_async();
     }
 
     atomic_store(&adc_stop_flag, 1);
     printf("[AutoScan] ✅ 任务完成: 共采集 %u 次\n", total_reads);
-    // [2026-10-15] 撤销扫描结束关断(原 [2026-10-09] 加的 disable_all_switch_via_cpld()
-    //   + disable_all_switch()): 实测关断后被测节点失源, 电压从激励值指数缓降
-    //   (τ≈2s, 1.58V->0.43V 平台), 而 ceshi_920 旧版扫描结束不关激励、CPLD 锁存
-    //   保持, 电压可长期稳定 —— 用户 A/B 对比确认旧版无此衰减现象。
-    //   现恢复旧行为: 扫描(含 0x21 中途停止)结束后激励保持, 节点电压稳定。
-    //   ⚠️ 有意为之: 被扫过的通道扫描结束后仍带激励电(与 920 一致), 非遗漏。
+
+    // [2026-10-23] 扫描结束(含被 0x21 中断)一律关闭全部开关通道, 使输出端静默,
+    //   示波器测量时不会看到开关切换 / 激励残留波形。
+    //   ⚠️ 必须在这里同步完成, 不能挪到异步线程: 上位机收到 0x1E 后会立刻下发
+    //   下一次 0x1D, 若关闭动作异步执行, 下一次扫描刚切好通道就被本动作全部关掉,
+    //   下一批数据会全废。放在回包前 = 借用 0x1D 的忙窗口做串行化。
+    //   ⚠️ 必须晚于脉冲处理: 先脉冲再关的话, 关断瞬态会被示波器拍进脉冲窗口;
+    //      先关后脉冲, 整个脉冲窗口内硬件都已是静默状态。
+    scan_disable_all_switch(aborted ? "采集中断" : "正常扫描完成");
+
     task_reply_u32(task_arg, 0x1E, total_reads, "AutoScanDone");
 
-    // [2026-10-16] 正常扫完才走"定时 1 秒后拉低"; 中断路径已在上面拉低
-    if (!aborted) {
-        usleep(1000 * 1000);
-        pd1415_low();
-    }
-
+    // ⚠️ [2026-10-23] 这里之后不能再有任何阻塞动作(usleep/等锁/等 IO):
+    // 本函数 return 之后 protocol.c 的 exec_wrapper() 才会释放 0x1D 的占用标记,
+    // 多停 1 秒就等于让上位机连续扫下一通道时吃到 0xF1 / 0x1D00 "当前操作忙"。
+    // PD14/PD15 的 1 秒脉冲已改由 pd1415_pulse_async() 的独立线程完成。
     free(task_arg);
 }
 
@@ -1161,7 +1321,9 @@ void Task_Adc_Stop(void *arg) {
     printf("[AdcStop]   已置位停止信号, 采集线程将退出\n");
 
     // [2026-10-16] 停止采集时同步把 PD14/PD15 拉低(不管是否正处在扫描后的 1 秒高电平窗口)
-    pd1415_low();
+    // [2026-10-23] 用 cancel 而不是直接 low: 同时要让挂起的脉冲线程失效,
+    //              否则它到点后还会再操作一次引脚。
+    pd1415_pulse_cancel();
     printf("[AdcStop]   PD14/PD15 已拉低\n");
 
     task_reply_u8(task_arg, 0x22, 0, "stop");
