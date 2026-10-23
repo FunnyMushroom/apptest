@@ -54,13 +54,8 @@ i2c_t *i2c_init(const char *device, int addr) {
     return i2c;
 }
 
-// 写一个字节到指定寄存器(写后等 1ms 让从机锁存)
+// 写一个字节到指定寄存器
 int i2c_write_byte(i2c_t *i2c, unsigned char reg, unsigned char data) {
-    return i2c_write_byte_ex(i2c, reg, data, 1000);
-}
-
-// 写一个字节到指定寄存器, 写后等待 delay_us 微秒(delay_us=0 表示不等待)
-int i2c_write_byte_ex(i2c_t *i2c, unsigned char reg, unsigned char data, unsigned int delay_us) {
     if (i2c == NULL || !i2c->is_open || i2c->fd < 0) {
         printf("[I2C] ❌ 写字节失败: 句柄无效(未初始化或已关闭)\n");
         return -1;
@@ -81,10 +76,8 @@ int i2c_write_byte_ex(i2c_t *i2c, unsigned char reg, unsigned char data, unsigne
         return -1;
     }
 
-    // 等待从机锁存寄存器(时间由调用方按场景给定)
-    if (delay_us > 0) {
-        usleep(delay_us);
-    }
+    // 等待从机锁存寄存器
+    usleep(1000);
     return 0;
 }
 
