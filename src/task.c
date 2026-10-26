@@ -1072,7 +1072,7 @@ static void pd1415_pulse_cancel(void) {
 }
 
 // ==================== 扫描收尾: 关闭全部开关通道 ====================
-// [2026-10-23]  自动扫描(0x1D)结束后关闭所有通道, 断开输出回路,
+// [2026-10-23] 用户要求: 自动扫描(0x1D)结束后关闭所有通道, 断开输出回路,
 //   使示波器测量时不再有开关切换 / 激励残留波形。
 //
 // ⚠️ 与 [2026-10-15] 的决议相反: 当时发现关断后被扫节点失源, 电压从激励值
@@ -1101,6 +1101,111 @@ static void scan_disable_all_switch(const char *reason) {
     printf("[AutoScan]   跳过关闭通道: SCAN_DISABLE_ALL_ON_DONE=0(保压模式)\n");
 #endif
 }
+
+// ==================== 采样值软件滤波(默认全部关闭) ====================
+// [2026-10-23] 对 0x1D 自动扫描逐点采样值做平滑。三种算法互斥, 默认一段都不启用
+//   (保持原样输出原始 ADC 值)。启用步骤见下方"用法"。
+//
+// ⚠️ 三种滤波各有代价, 选之前先想清楚要滤什么:
+//   - 一阶低通: 对白噪声最省资源(O(1)), 但会引入相位滞后, 信号跳变沿被抹平;
+//   - 滑动均值: 对白噪声抑制最强, 同样抹平跳变沿, 且对尖峰(毛刺)几乎无效;
+//   - 滑动中值: 专门吃单点尖峰/毛刺, 且能保住跳变沿, 但对白噪声的抑制弱于均值。
+//   连续扫多通道时, 通道切换的瞬态已由前面的"弛豫丢弃"处理, 滤波主要压稳态噪声。
+//
+// 用法(三步都做, 少一步编译不过或用不上):
+//   1. 把本段里的宏定义块(含 SCAN_FILTER_*)整体解开注释;
+//   2. 把要用的那种滤波对应的"状态变量 + 实现函数"整体解开注释
+//      (三种可以全解开放着, 靠 SCAN_FILTER 宏决定实际走哪条路, 不冲突);
+//   3. 把下面两处调用行的注释解开:
+//        - 每通道弛豫结束后: scan_filter_reset();
+//        - 采样循环内:       adc_val = scan_filter_apply(adc_val);
+//
+// #define SCAN_FILTER_NONE    0
+// #define SCAN_FILTER_LPF     1
+// #define SCAN_FILTER_MEAN    2
+// #define SCAN_FILTER_MEDIAN  3
+// #define SCAN_FILTER         SCAN_FILTER_NONE   // <- 改这里切换算法
+//
+// #define SCAN_FILTER_ALPHA   0.2f   // 一阶低通系数(0,1]: 越小越平滑、滞后越大
+// #define SCAN_FILTER_WINDOW  7      // 均值/中值窗口点数: 中值请用奇数
+//                                    // 窗口越大越平滑, 滞后 = (WINDOW-1)/2 个采样点
+
+// ---------- 一阶低通(IIR): y[n] = y[n-1] + alpha * (x[n] - y[n-1]) ----------
+// 每段都用 #if 包住: 三段可以全解开放着, 只有被 SCAN_FILTER 选中的那段参与编译,
+// 不会产生"static 函数未使用"告警。
+// #if SCAN_FILTER == SCAN_FILTER_LPF
+// static float    g_lpf_y    = 0.0f;
+// static int      g_lpf_init = 0;
+// static uint32_t scan_filter_lpf(uint32_t x) {
+//     if (!g_lpf_init) {              // 首点直接建立, 避免从 0 缓慢爬升
+//         g_lpf_y    = (float)x;
+//         g_lpf_init = 1;
+//     } else {
+//         g_lpf_y += SCAN_FILTER_ALPHA * ((float)x - g_lpf_y);
+//     }
+//     return (uint32_t)(g_lpf_y + 0.5f);
+// }
+// #endif
+
+// ---------- 滑动均值: 窗口内算术平均 ----------
+// #if SCAN_FILTER == SCAN_FILTER_MEAN
+// static uint32_t g_mean_buf[SCAN_FILTER_WINDOW];
+// static int      g_mean_idx = 0;
+// static int      g_mean_cnt = 0;
+// static uint32_t scan_filter_mean(uint32_t x) {
+//     g_mean_buf[g_mean_idx] = x;
+//     g_mean_idx = (g_mean_idx + 1) % SCAN_FILTER_WINDOW;
+//     if (g_mean_cnt < SCAN_FILTER_WINDOW) g_mean_cnt++;
+//     uint32_t sum = 0;
+//     for (int i = 0; i < g_mean_cnt; i++) sum += g_mean_buf[i];
+//     return sum / (uint32_t)g_mean_cnt;
+// }
+// #endif
+
+// ---------- 滑动中值: 窗口内取中位数(插入排序, 窗口小所以开销可接受) ----------
+// #if SCAN_FILTER == SCAN_FILTER_MEDIAN
+// static uint32_t g_med_buf[SCAN_FILTER_WINDOW];
+// static int      g_med_idx = 0;
+// static int      g_med_cnt = 0;
+// static uint32_t scan_filter_median(uint32_t x) {
+//     g_med_buf[g_med_idx] = x;
+//     g_med_idx = (g_med_idx + 1) % SCAN_FILTER_WINDOW;
+//     if (g_med_cnt < SCAN_FILTER_WINDOW) g_med_cnt++;
+//
+//     uint32_t tmp[SCAN_FILTER_WINDOW];
+//     for (int i = 0; i < g_med_cnt; i++) tmp[i] = g_med_buf[i];
+//     for (int i = 1; i < g_med_cnt; i++) {          // 插入排序(升序)
+//         uint32_t key = tmp[i];
+//         int j = i - 1;
+//         while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; j--; }
+//         tmp[j + 1] = key;
+//     }
+//     return tmp[g_med_cnt / 2];                     // 奇数窗口=正中; 偶数取偏大一侧
+// }
+// #endif
+
+// ---------- 统一入口 + 状态复位 ----------
+// 每个通道切换时调用一次, 清空窗口历史, 防止上一通道的残值污染本通道开头几点
+// static void scan_filter_reset(void) {
+// #if SCAN_FILTER == SCAN_FILTER_LPF
+//     g_lpf_init = 0;
+// #elif SCAN_FILTER == SCAN_FILTER_MEAN
+//     g_mean_idx = 0; g_mean_cnt = 0;
+// #elif SCAN_FILTER == SCAN_FILTER_MEDIAN
+//     g_med_idx  = 0; g_med_cnt  = 0;
+// #endif
+// }
+// static uint32_t scan_filter_apply(uint32_t x) {
+// #if SCAN_FILTER == SCAN_FILTER_LPF
+//     return scan_filter_lpf(x);
+// #elif SCAN_FILTER == SCAN_FILTER_MEAN
+//     return scan_filter_mean(x);
+// #elif SCAN_FILTER == SCAN_FILTER_MEDIAN
+//     return scan_filter_median(x);
+// #else
+//     return x;
+// #endif
+// }
 
 // ==================== 自动 ADC 采集 ====================
 // 从队列取通道, 每通道采 Times_Read_ADC121 次(0x1B 设置), 发送原始数据
@@ -1192,6 +1297,14 @@ void Task_ADC_Auto_Scan(void *arg) {
             while (dropped < SCAN_SETTLE_MAX_POINTS) {
                 uint32_t v = ADS8691_Read();
                 dropped++;
+
+                // [滤波-可选] 启用滤波时解开: 用弛豫期的读数预热窗口。
+                //   弛豫通常丢几十点, 足够填满窗口, 这样正式采样第 1 点就是干净的;
+                //   不预热的话, 正式采样开头 WINDOW-1 点处于"窗口填充期", 输出可能
+                //   明显偏离(实测中值滤波若不预热, 前 6 点最大偏差可达 3000 LSB)。
+                //   注意跳过 SPI 失败值, 别把 0xFFFFFFFF 灌进窗口。
+                // if (v != 0xFFFFFFFF) (void)scan_filter_apply(v);
+
                 // [2026-10-16] 丢弃期进度打印: 每 50 点一行, 避免这段时间"像卡住"
                 if (dropped % 50 == 0) {
                     printf("[AutoScan]   通道 %u: 弛豫中, 已丢 %d/%d 点, 最新 ADC=%u\n",
@@ -1218,10 +1331,18 @@ void Task_ADC_Auto_Scan(void *arg) {
                    ch_info.collect, dropped);
         }
 
+        // [滤波-调用点 1/2] 启用滤波时解开: 换通道后清空窗口历史
+        // scan_filter_reset();
+
         for (int i = 0; i < samples_per_ch; i++) {
             if (atomic_load(&adc_stop_flag)) break;
 
              uint32_t adc_val = ADS8691_Read();
+
+            // [滤波-调用点 2/2] 启用滤波时解开: 对采样值套用选定算法
+            // 注意: 下行之后的 voltage 计算与 0x1E 上传用的都是滤波后的值;
+            //       若想"上传原始值、只在日志里看滤波效果", 改用 adc_val_f 即可。
+            // adc_val = scan_filter_apply(adc_val);
 
             // uint32_t adc_val1 = ADS8691_Read_l();
 
