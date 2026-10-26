@@ -18,7 +18,6 @@
 #include "fpga_i2c.h"
 #include "dac8562.h"
 #include "ads8691.h"
-#include "ads8691_l.h"
 #include "ads1115.h"
 #include <usart.h>
 #include <main.h>
@@ -1120,32 +1119,32 @@ static void scan_disable_all_switch(const char *reason) {
 //        - 每通道弛豫结束后: scan_filter_reset();
 //        - 采样循环内:       adc_val = scan_filter_apply(adc_val);
 //
-#define SCAN_FILTER_NONE    0
-#define SCAN_FILTER_LPF     1
-#define SCAN_FILTER_MEAN    2
-#define SCAN_FILTER_MEDIAN  3
-#define SCAN_FILTER         SCAN_FILTER_LPF   // <- 改这里切换算法
+// #define SCAN_FILTER_NONE    0
+// #define SCAN_FILTER_LPF     1
+// #define SCAN_FILTER_MEAN    2
+// #define SCAN_FILTER_MEDIAN  3
+// #define SCAN_FILTER         SCAN_FILTER_LPF   // <- 改这里切换算法
 
-#define SCAN_FILTER_ALPHA   0.2f   // 一阶低通系数(0,1]: 越小越平滑、滞后越大
-#define SCAN_FILTER_WINDOW  7      // 均值/中值窗口点数: 中值请用奇数
-                                   // 窗口越大越平滑, 滞后 = (WINDOW-1)/2 个采样点
+// #define SCAN_FILTER_ALPHA   0.2f   // 一阶低通系数(0,1]: 越小越平滑、滞后越大
+// #define SCAN_FILTER_WINDOW  7      // 均值/中值窗口点数: 中值请用奇数
+//                                    // 窗口越大越平滑, 滞后 = (WINDOW-1)/2 个采样点
 
 // ---------- 一阶低通(IIR): y[n] = y[n-1] + alpha * (x[n] - y[n-1]) ----------
 // 每段都用 #if 包住: 三段可以全解开放着, 只有被 SCAN_FILTER 选中的那段参与编译,
 // 不会产生"static 函数未使用"告警。
-#if SCAN_FILTER == SCAN_FILTER_LPF
-static float    g_lpf_y    = 0.0f;
-static int      g_lpf_init = 0;
-static uint32_t scan_filter_lpf(uint32_t x) {
-    if (!g_lpf_init) {              // 首点直接建立, 避免从 0 缓慢爬升
-        g_lpf_y    = (float)x;
-        g_lpf_init = 1;
-    } else {
-        g_lpf_y += SCAN_FILTER_ALPHA * ((float)x - g_lpf_y);
-    }
-    return (uint32_t)(g_lpf_y + 0.5f);
-}
-#endif
+// #if SCAN_FILTER == SCAN_FILTER_LPF
+// static float    g_lpf_y    = 0.0f;
+// static int      g_lpf_init = 0;
+// static uint32_t scan_filter_lpf(uint32_t x) {
+//     if (!g_lpf_init) {              // 首点直接建立, 避免从 0 缓慢爬升
+//         g_lpf_y    = (float)x;
+//         g_lpf_init = 1;
+//     } else {
+//         g_lpf_y += SCAN_FILTER_ALPHA * ((float)x - g_lpf_y);
+//     }
+//     return (uint32_t)(g_lpf_y + 0.5f);
+// }
+// #endif
 
 // ---------- 滑动均值: 窗口内算术平均 ----------
 // #if SCAN_FILTER == SCAN_FILTER_MEAN
@@ -1186,26 +1185,26 @@ static uint32_t scan_filter_lpf(uint32_t x) {
 
 // ---------- 统一入口 + 状态复位 ----------
 // 每个通道切换时调用一次, 清空窗口历史, 防止上一通道的残值污染本通道开头几点
-static void scan_filter_reset(void) {
-#if SCAN_FILTER == SCAN_FILTER_LPF
-    g_lpf_init = 0;
-#elif SCAN_FILTER == SCAN_FILTER_MEAN
-    g_mean_idx = 0; g_mean_cnt = 0;
-#elif SCAN_FILTER == SCAN_FILTER_MEDIAN
-    g_med_idx  = 0; g_med_cnt  = 0;
-#endif
-}
-static uint32_t scan_filter_apply(uint32_t x) {
-#if SCAN_FILTER == SCAN_FILTER_LPF
-    return scan_filter_lpf(x);
-#elif SCAN_FILTER == SCAN_FILTER_MEAN
-    return scan_filter_mean(x);
-#elif SCAN_FILTER == SCAN_FILTER_MEDIAN
-    return scan_filter_median(x);
-#else
-    return x;
-#endif
-}
+// static void scan_filter_reset(void) {
+// #if SCAN_FILTER == SCAN_FILTER_LPF
+//     g_lpf_init = 0;
+// #elif SCAN_FILTER == SCAN_FILTER_MEAN
+//     g_mean_idx = 0; g_mean_cnt = 0;
+// #elif SCAN_FILTER == SCAN_FILTER_MEDIAN
+//     g_med_idx  = 0; g_med_cnt  = 0;
+// #endif
+// }
+// static uint32_t scan_filter_apply(uint32_t x) {
+// #if SCAN_FILTER == SCAN_FILTER_LPF
+//     return scan_filter_lpf(x);
+// #elif SCAN_FILTER == SCAN_FILTER_MEAN
+//     return scan_filter_mean(x);
+// #elif SCAN_FILTER == SCAN_FILTER_MEDIAN
+//     return scan_filter_median(x);
+// #else
+//     return x;
+// #endif
+// }
 
 // ==================== 自动 ADC 采集 ====================
 // 从队列取通道, 每通道采 Times_Read_ADC121 次(0x1B 设置), 发送原始数据
@@ -1342,7 +1341,7 @@ void Task_ADC_Auto_Scan(void *arg) {
             // [滤波-调用点 2/2] 启用滤波时解开: 对采样值套用选定算法
             // 注意: 下行之后的 voltage 计算与 0x1E 上传用的都是滤波后的值;
             //       若想"上传原始值、只在日志里看滤波效果", 改用 adc_val_f 即可。
-            adc_val = scan_filter_apply(adc_val);
+            // adc_val = scan_filter_apply(adc_val);
 
             // uint32_t adc_val1 = ADS8691_Read_l();
 

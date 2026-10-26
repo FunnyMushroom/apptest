@@ -20,7 +20,6 @@
 #include "usart.h"
 #include <mqueue.h>
 #include "ads8691.h"
-#include "ads8691_l.h"
 #include <sys/reboot.h>
 #include "485_cpld.h"
 // 本文件属于哪个分模块打印开关(必须在 #include "log.h" 之前定义)
