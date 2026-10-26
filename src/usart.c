@@ -160,4 +160,3 @@ void usart_close(usart_t *usart) {
 }
 
 
-//V829 
