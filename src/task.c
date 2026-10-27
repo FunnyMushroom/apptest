@@ -958,9 +958,13 @@ void Task_Set_Scan_Channels(void *arg) {
 //   视为已稳定(节点已稳时约 0.4s 通过; 有弛豫时按上限强制开采)。
 //   [2026-10-16] 上限从 1000 点(≈5.7s)降到 350 点(≈2.0s, 实测约 5.7ms/点):
 //   用户反馈"等待太久", 但保留 2 秒确保慢弛豫节点也能等稳。
-#define SCAN_SETTLE_BLOCK        20     // 块大小(点), ~0.11s
-#define SCAN_SETTLE_DIFF_LSB     150    // 稳定判据: 相邻块均值差 < 150 LSB(≈14mV)
-#define SCAN_SETTLE_MAX_POINTS   350    // 丢弃上限(~2.0s), 超时强制进入正式采样
+
+//2026-10-26    SCAN_SETTLE_BLOCK:20 -> 100
+#define SCAN_SETTLE_BLOCK        100     // 块大小(点), ~0.11s
+//2026-10-26    SCAN_SETTLE_DIFF_LSB:150 -> 30
+#define SCAN_SETTLE_DIFF_LSB     30    // 稳定判据: 相邻块均值差 < 150 LSB(≈14mV)
+//2026-10-26    SCAN_SETTLE_MAX_POINTS:350 -> 2400
+#define SCAN_SETTLE_MAX_POINTS   2400    // 丢弃上限(~2.0s), 超时强制进入正式采样
 
 // ==================== PD14/PD15 同步脉冲(异步执行) ====================
 // [2026-10-23 修复 连续多通道扫描丢包]
@@ -1416,7 +1420,7 @@ void Task_ADC_Auto_Scan(void *arg) {
     //   下一批数据会全废。放在回包前 = 借用 0x1D 的忙窗口做串行化。
     //   ⚠️ 必须晚于脉冲处理: 先脉冲再关的话, 关断瞬态会被示波器拍进脉冲窗口;
     //      先关后脉冲, 整个脉冲窗口内硬件都已是静默状态。
-    scan_disable_all_switch(aborted ? "采集中断" : "正常扫描完成");
+    // scan_disable_all_switch(aborted ? "采集中断" : "正常扫描完成");
 
     task_reply_u32(task_arg, 0x1E, total_reads, "AutoScanDone");
 
