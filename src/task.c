@@ -879,6 +879,10 @@ void split_num(uint16_t num, uint8_t *high, uint8_t *low)
 // 回包 0x24: 数据位宽与请求保持一致, 同为 4 字节(32位, 大端)
 //   成功: 原样回显收到的 4 字节 (collect+switch), 便于上位机核对
 //   失败: 0xFFFFFFFE = 队列已满, 0xFFFFFFFF = adc_stop_flag 未置 1(被拒)
+// [2026-11-02] 提前声明: 本函数里要先把上一次扫描留下的 PD14/PD15 脉冲拉低
+//   (定义在本文件后部 PD14/PD15 脉冲那一节)
+static int pd1415_pulse_cancel(void);
+
 void Task_Set_Scan_Channels(void *arg) {
     command_t *task_arg = (command_t *)arg;
     uint8_t *data = task_arg->data;
@@ -894,6 +898,26 @@ void Task_Set_Scan_Channels(void *arg) {
         free(task_arg->data);
         free(task_arg);
         return;
+    }
+
+    // ==================== 关键时序修复 ====================
+    // [2026-11-02] 在这里(0x23 到达时)就把上一次扫描留下的 PD14/PD15 脉冲拉低。
+    //
+    //   现场现象: 上位机偶尔把一次本来正常的扫描判成失败, 对应的日志是
+    //       xx:xx:xx.701 [pd1415] ✅ ... 已恢复低电平        <- 扫描已经开始之后!
+    //       xx:xx:xx.702 [AutoScan] 队列共 1 个通道 ...
+    //   实测每一次扫描开始时(0x1D 之后的 4~6ms)都会出现一次"拉低", 因为:
+    //       扫描结束 -> PD14/PD15 拉高(1 秒同步脉冲)
+    //       上位机 355ms 后发 0x23, 再 13ms 后发 0x1D
+    //       原来要等 0x1D 进到扫描任务里才去打断脉冲 -> 拉低落在"扫描开始之后"
+    //   上位机若在这段窗口里读到高->低跳变, 就会认为"本轮扫描已结束"(实测 9 次撞 1 次)。
+    //
+    //   移到 0x23: 拉低发生在 0x1D 之前(实测早 13ms), 整个扫描过程 PD14/PD15 恒为低,
+    //   扫描期间不再出现任何下降沿; 而这次"拉低"仍然紧跟在上一次扫描结束之后, 语义不变。
+    //   配合 gpio_app.c 里 PD14/PD15 改为常驻句柄(拉低从 ~6ms 降到 <0.1ms), 窗口彻底消失。
+    if (pd1415_pulse_cancel()) {
+        printf("[SetScanChannels]   已在 0x23 阶段拉低 PD14/PD15"
+               "(上一次扫描的同步脉冲提前结束, 早于 0x1D)\n");
     }
 
     // 解析 4 字节数据: 前2字节为 collect, 后2字节为 switch (大端)
@@ -916,13 +940,28 @@ void Task_Set_Scan_Channels(void *arg) {
         free(task_arg);
         return;
     }
-    int i=1;
+    // [2026-11-02 修复] 幂等: 同一条 0x23 被重发时不能重复入队
+    //   场景: 下位机已入队并回了 0x24, 但应答在总线上丢了 -> 上位机超时重发同一条 0x23。
+    //   此时上一次执行已经结束(操作码不再"忙"), 去重机制拦不住, 于是同一通道被入队两次,
+    //   下一次 0x1D 会扫 2 个通道、回 2 倍帧数, 上位机按 1 个通道的组去收 -> 整组串组。
+    //   判据: 队列末尾已经是同一条通道(collect+switch 都相同), 即视为重发, 不再追加。
+    if (g_scan_queue_len > 0 &&
+        g_scan_queue[g_scan_queue_len - 1].collect == collect_ch &&
+        g_scan_queue[g_scan_queue_len - 1].sw == switch_ch) {
+        printf("[SetScanChannels] 🔁 重发请求: 尾部已是同一通道(collect=%u, switch=%u), "
+               "不重复入队\n", collect_ch, switch_ch);
+        pthread_mutex_unlock(&g_scan_queue_lock);
+        free(task_arg->data);
+        task_arg->data = NULL;
+        task_reply_u32(task_arg, 0x24, echo_data, "SetScanChannels");
+        free(task_arg);
+        return;
+    }
+
     // 添加到队列
-    while(i--){
     g_scan_queue[g_scan_queue_len].collect = collect_ch;
     g_scan_queue[g_scan_queue_len].sw = switch_ch;
     g_scan_queue_len++;
-}
     // [2026-10-13] 移除 SD 落盘(lxlceshi.txt): 现场不使用 SD 卡
     // 把整条队列拼成一行输出: 逐个 printf 会让日志前缀插到行中间
     {
@@ -1057,8 +1096,9 @@ static int pd1415_pulse_async(void) {
 }
 
 // 打断尚未结束的同步脉冲: 立即拉低, 并让挂起的脉冲线程失效。
+// 返回 1 = 确实打断了一个还在高电平的脉冲, 0 = 本来就已经是低电平。
 // 必须在每次扫描开始前调用 —— 采集期间 PD14/PD15 为高会把 ADC 读数压到 ~0V。
-static void pd1415_pulse_cancel(void) {
+static int pd1415_pulse_cancel(void) {
     pthread_mutex_lock(&g_pd1415_lock);
     int was_high = g_pd1415_high_now;
     g_pd1415_high_now = 0;
@@ -1072,6 +1112,7 @@ static void pd1415_pulse_cancel(void) {
         printf("[pd1415] ⚠️ 已打断未结束的同步脉冲: "
                "采集期间 PD14/PD15 必须保持低电平(高电平时 ADC 读数为 ~0V)\n");
     }
+    return was_high;
 }
 
 // ==================== 扫描收尾: 关闭全部开关通道 ====================
@@ -1223,9 +1264,18 @@ void Task_ADC_Auto_Scan(void *arg) {
     // [2026-10-23] 采集前必须先确保 PD14/PD15 为低: 上一次扫描结束时的 1 秒同步
     // 脉冲可能还没走完, 而该引脚为高会把 ADS8691 的读数压到 ~0V(实测), 导致本次
     // 扫描前 ~100 个点全是垃圾值。这里打断未结束的脉冲并立即拉低。
-    pd1415_pulse_cancel();
+    // [2026-11-02] 兜底: 正常情况下 0x23 那一步已经把它拉低了(见 Task_Set_Scan_Channels)。
+    //   走到这里还能打断到高电平, 说明上位机这次没先发 0x23 就直接发了 0x1D ——
+    //   此时拉低落在"扫描开始之后", 上位机可能误判为"扫描结束", 所以显式告警便于取证。
+    if (pd1415_pulse_cancel()) {
+        printf("[AutoScan] ⚠️ 0x1D 到达时 PD14/PD15 仍为高电平(此前未收到 0x23): "
+               "拉低发生在扫描开始之后, 上位机可能误判为扫描已结束\n");
+    }
 
-    atomic_store(&adc_stop_flag, 0);
+    // [2026-11-02] adc_stop_flag 的置 0 挪到"队列已取到"之后:
+    //   0x23(入队)要求 adc_stop_flag==1 才受理, 若这里先置 0, 一旦 0x23 的线程
+    //   比 0x1D 晚跑, 它就会被判"设置被拒"而不入队 -> 本次扫描 0 个通道 -> 该点必失败。
+    //   放到后面既保留了"采集中标志位为 0"的原语义, 又给 0x23 留出了执行窗口。
 
     uint32_t total_reads = 0;
     int samples_per_ch = Times_Read_ADC121;
@@ -1237,16 +1287,36 @@ void Task_ADC_Auto_Scan(void *arg) {
     scan_channel_t local_queue[MAX_SCAN_CHANNELS];
     int queue_len = 0;
 
-    pthread_mutex_lock(&g_scan_queue_lock);
-    queue_len = g_scan_queue_len;
-    if (queue_len > MAX_SCAN_CHANNELS) {
-        queue_len = MAX_SCAN_CHANNELS;
+    // [2026-11-02] 队列为空时短等一会儿: 0x23 与 0x1D 是两条命令, 由线程池里
+    //   不同的线程执行, 理论上 0x1D 有可能先跑完(队列还没被 0x23 填上)。
+    //   原来遇到这种情况会"扫 0 个通道 -> 本次一帧 0x1E 都不发", 上位机直接判该点失败。
+    //   这里最多等 200ms(10ms 一轮), 等到就正常扫, 等不到再按原逻辑往下走。
+    for (int wait_ms = 0; ; wait_ms += 10) {
+        pthread_mutex_lock(&g_scan_queue_lock);
+        queue_len = g_scan_queue_len;
+        if (queue_len > MAX_SCAN_CHANNELS) {
+            queue_len = MAX_SCAN_CHANNELS;
+        }
+        if (queue_len > 0) {
+            memcpy(local_queue, g_scan_queue, sizeof(scan_channel_t) * (size_t)queue_len);
+            g_scan_queue_len = 0;      // 队列已被本次扫描取走, 清空供下次使用
+        }
+        pthread_mutex_unlock(&g_scan_queue_lock);
+
+        if (queue_len > 0 || wait_ms >= 200) {
+            break;
+        }
+        if (wait_ms == 0) {
+            printf("[AutoScan] ⚠️ 扫描队列暂时为空(0x23 可能还没执行完), 最多等 200ms\n");
+        }
+        usleep(10 * 1000);
     }
-    if (queue_len > 0) {
-        memcpy(local_queue, g_scan_queue, sizeof(scan_channel_t) * (size_t)queue_len);
+    if (queue_len == 0) {
+        printf("[AutoScan] ❌ 队列仍为空: 本次不会回任何 0x1E 数据帧(上位机会判该点失败)\n");
     }
-    g_scan_queue_len = 0;      // 队列已被本次扫描取走, 清空供下次使用
-    pthread_mutex_unlock(&g_scan_queue_lock);
+
+    // 队列已取到, 现在才把"采集中"标志置 0(见上面挪动的说明)
+    atomic_store(&adc_stop_flag, 0);
 
 // card = 1, channel = 101
     printf("[AutoScan]   队列共 %d 个通道, 开始逐个扫描\n", queue_len);

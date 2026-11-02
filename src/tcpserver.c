@@ -406,7 +406,7 @@ static void *tcp_server_loop(void *arg)
         // 断线回收: TCP keepalive 探测到失联后, 该 socket 进入错误状态,
         // select 将其报告为可读, 上方 handle_client_data 中 recv 返回错误即走 close_client
 
-        // 解析超时检查: 卡住超过 PARSE_TIMEOUT_SEC 秒的解析器强制重置
+        // 解析超时检查: 卡住超过 PARSE_TIMEOUT_MS 毫秒的解析器强制重置
         for (int i = 0; i < MAX_CLIENTS; ++i) {
             if (server->clients[i].fd != -1 &&
                 protocol_parser_check_timeout(&server->clients[i].parser)) {

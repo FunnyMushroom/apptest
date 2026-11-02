@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "gpio_app.h"
 #include "gpio.h"
@@ -139,43 +140,82 @@ void init_all_gpios(void) {
 // [2026-10-16] 用途: ADC 扫描(0x1D)全部采样完成后, PD14/PD15 立刻输出高电平,
 // 定时 1 秒后恢复低电平, 供外部设备做同步/触发。
 // 编号: PD14 = 96 + 14 = 110, PD15 = 96 + 15 = 111
+//
+// [2026-11-02 修复] 改成"常驻 line handle", 不再每次开关设备节点。
+//   原实现每次拉高/拉低都是 gpio_init + gpio_set_value + gpio_close, 即两次
+//   open("/dev/gpiochip0") + 两次 GPIO_GET_LINEHANDLE + 两次 set + 两次 close,
+//   实测整组耗时约 6ms(日志里 PD14/PD15 两行 GPIO 初始化+关闭共 6~7 条记录)。
+//   后果: 扫描开始的"拉低"要等 6ms 才真正落到引脚上 —— 这 6ms 里 PD14/PD15 还是高电平,
+//   上位机若在这段窗口里读到"高 -> 低"的跳变, 就会把本轮扫描误判成"已结束"
+//   (实测 9 次里出现 1 次)。改成常驻句柄后, 一次电平切换只剩一次 set ioctl(几十微秒),
+//   窗口小到可以忽略。
 #define PD14_GPIO_NUM   110
 #define PD15_GPIO_NUM   111
 
-int pd1415_high(void) {
-    gpio_t *g14 = gpio_init(PD14_GPIO_NUM, GPIO_DIR_OUT);
-    gpio_t *g15 = gpio_init(PD15_GPIO_NUM, GPIO_DIR_OUT);
+static gpio_t *g_pd14 = NULL;
+static gpio_t *g_pd15 = NULL;
+static pthread_mutex_t g_pd1415_gpio_lock = PTHREAD_MUTEX_INITIALIZER;
 
-    if (!g14 || !g15) {
+// 申请(或复用) PD14/PD15 的输出句柄: 成功返回 0
+static int pd1415_gpio_ensure(void) {
+    if (g_pd14 == NULL) {
+        g_pd14 = gpio_init(PD14_GPIO_NUM, GPIO_DIR_OUT);
+    }
+    if (g_pd15 == NULL) {
+        g_pd15 = gpio_init(PD15_GPIO_NUM, GPIO_DIR_OUT);
+    }
+    if (g_pd14 == NULL || g_pd15 == NULL) {
         printf("[pd1415] ❌ 初始化失败: PD14/PD15 占用未成功\n");
-        if (g14) gpio_close(g14);
-        if (g15) gpio_close(g15);
         return -1;
     }
-    gpio_set_value(g14, GPIO_HIGH);
-    gpio_set_value(g15, GPIO_HIGH);
-    gpio_close(g14);
-    gpio_close(g15);
-    printf("[pd1415] ✅ PD14(110)/PD15(111) 已输出高电平\n");
     return 0;
 }
 
-int pd1415_low(void) {
-    gpio_t *g14 = gpio_init(PD14_GPIO_NUM, GPIO_DIR_OUT);
-    gpio_t *g15 = gpio_init(PD15_GPIO_NUM, GPIO_DIR_OUT);
+// 句柄失效(设备节点重启过等)时丢掉缓存, 下次重新申请
+static void pd1415_gpio_drop(void) {
+    if (g_pd14) { gpio_close(g_pd14); g_pd14 = NULL; }
+    if (g_pd15) { gpio_close(g_pd15); g_pd15 = NULL; }
+}
 
-    if (!g14 || !g15) {
-        printf("[pd1415] ❌ 初始化失败: PD14/PD15 占用未成功\n");
-        if (g14) gpio_close(g14);
-        if (g15) gpio_close(g15);
+static int pd1415_write(gpio_value_t value) {
+    int rc;
+
+    pthread_mutex_lock(&g_pd1415_gpio_lock);
+
+    rc = pd1415_gpio_ensure();
+    if (rc == 0) {
+        if (gpio_set_value(g_pd14, value) != 0 || gpio_set_value(g_pd15, value) != 0) {
+            // 先重来一次: 可能是句柄被内核回收了
+            pd1415_gpio_drop();
+            if (pd1415_gpio_ensure() == 0) {
+                rc = (gpio_set_value(g_pd14, value) == 0 && gpio_set_value(g_pd15, value) == 0)
+                     ? 0 : -1;
+            } else {
+                rc = -1;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_pd1415_gpio_lock);
+
+    if (rc != 0) {
+        printf("[pd1415] ❌ PD14/PD15 输出%s失败\n", value == GPIO_HIGH ? "高电平" : "低电平");
         return -1;
     }
-    gpio_set_value(g14, GPIO_LOW);
-    gpio_set_value(g15, GPIO_LOW);
-    gpio_close(g14);
-    gpio_close(g15);
-    printf("[pd1415] ✅ PD14(110)/PD15(111) 已恢复低电平\n");
+    if (value == GPIO_HIGH) {
+        printf("[pd1415] ✅ PD14(110)/PD15(111) 已输出高电平\n");
+    } else {
+        printf("[pd1415] ✅ PD14(110)/PD15(111) 已恢复低电平\n");
+    }
     return 0;
+}
+
+int pd1415_high(void) {
+    return pd1415_write(GPIO_HIGH);
+}
+
+int pd1415_low(void) {
+    return pd1415_write(GPIO_LOW);
 }
 int disable_all_switch(void) {
     int pa11 = 11;   // PA11

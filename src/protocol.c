@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 
@@ -23,6 +24,14 @@
 
 static pthread_mutex_t g_exec_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t         g_opcode_busy[OPCODE_MAX];
+static uint64_t        g_opcode_busy_since[OPCODE_MAX];   // 本次占用开始时刻(ms)
+
+// 单调时钟(ms): 只用于算时间差, 不受系统改时间影响
+static uint64_t proto_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
+}
 
 // 尝试占用操作码: 返回1=成功占用, 0=该操作码正在执行中
 static int opcode_try_acquire(uint8_t opcode) {
@@ -31,9 +40,19 @@ static int opcode_try_acquire(uint8_t opcode) {
     ret = (g_opcode_busy[opcode] == 0);
     if (ret) {
         g_opcode_busy[opcode] = 1;
+        g_opcode_busy_since[opcode] = proto_now_ms();
     }
     pthread_mutex_unlock(&g_exec_lock);
     return ret;
+}
+
+// 读取某操作码"本次占用"的开始时刻: 用于判断缓存应答是否属于当前这次执行
+static uint64_t opcode_busy_since(uint8_t opcode) {
+    uint64_t v;
+    pthread_mutex_lock(&g_exec_lock);
+    v = g_opcode_busy_since[opcode];
+    pthread_mutex_unlock(&g_exec_lock);
+    return v;
 }
 
 // 释放操作码占用(由任务真正执行完毕后调用)
@@ -64,6 +83,94 @@ static void exec_wrapper(void *p) {
     w->function(w->arg);
     opcode_release(op);
     free(w);
+}
+
+// ==================== 重发请求: 原应答回放 ====================
+// 现网失效链: 上位机 3s 没等到应答 -> 重发同一条命令。
+//   旧行为: 下位机判"重复指令", 回 0xF1;
+//           而上位机等的是 0x24/0x0E/0x1C, 于是这条命令**永远**拿不到应答 -> 步骤必失败。
+//   新行为: 若上一次执行的应答确实已经发出(只是上位机没收到), 且本次重发的数据与原请求
+//           逐字节相同, 就直接把那份应答再发一遍, 让重试真正生效。
+// 三个限制保证不会误回放:
+//   1) 只对 485 通道做(TCP 是字节流, 不会凭空丢包, 不需要);
+//   2) 缓存的应答必须属于"当前这次占用"(ts >= busy_since), 即上一次执行的成果,
+//      不能是几分钟前某次同名命令的应答;
+//   3) 太新(<20ms)不回放: 那种情况第一份应答还在路上, 再发一份会造成重复应答。
+// 窗口取 5s: 上位机超时 3s 重发, 留出余量; 同时"同一命令隔很久又被执行"的情况
+// 由 "ts >= busy_since" 挡住, 不会被误回放成旧答案。
+#define DUP_CACHE_MAX_AGE_MS   5000   // 缓存超过这个年龄不再回放
+#define DUP_CACHE_MIN_AGE_MS     20   // 缓存太新(第一份应答可能还在路上)不回放
+#define DUP_CACHE_FP_MAX          8   // 数据指纹长度上限
+#define DUP_CACHE_RESP_MAX       64   // 可缓存的回包长度上限
+
+typedef struct {
+    uint8_t  valid;
+    uint8_t  fp_len;
+    uint8_t  fp[DUP_CACHE_FP_MAX];
+    uint16_t resp_len;
+    uint8_t  resp[DUP_CACHE_RESP_MAX];
+    uint64_t ts_ms;
+} dup_cache_t;
+
+static pthread_mutex_t g_dup_lock = PTHREAD_MUTEX_INITIALIZER;
+static dup_cache_t     g_dup_cache[OPCODE_MAX];
+
+// 流式数据命令(0x1D 扫描)的应答是一帧帧的 0x1E, 缓存/回放毫无意义, 必须排除
+static int dup_cache_opcode_ok(uint8_t opcode) {
+    return (opcode != 0x1D && opcode != 0xFF);
+}
+
+// 记录一份已发出的回包(供重发请求回放)。仅 485 通道 + 短回包 + 非错误码。
+static void dup_cache_store(const command_t *command, const uint8_t *buf, int len) {
+    if (command == NULL || buf == NULL) return;
+    if (command->channel != RESPONSE_CHANNEL_RS485) return;
+    if (!dup_cache_opcode_ok(command->opcode)) return;
+    if (len < (int)PROTOCOL_DATA_OFFSET || len > DUP_CACHE_RESP_MAX) return;
+    if (command->req_fp_len == 0 || command->req_fp_len > DUP_CACHE_FP_MAX) return;
+
+    uint8_t resp_opcode = buf[PROTOCOL_HEADER_SIZE - 1];   // 回包操作码(帧内偏移 6)
+    if (resp_opcode == 0xF1 || resp_opcode == 0xF2 || resp_opcode == 0xF3) {
+        return;   // 错误码应答不是"答案", 不能拿去回放
+    }
+
+    pthread_mutex_lock(&g_dup_lock);
+    dup_cache_t *c = &g_dup_cache[command->opcode];
+    c->valid    = 1;
+    c->fp_len   = command->req_fp_len;
+    memcpy(c->fp, command->req_fp, command->req_fp_len);
+    c->resp_len = (uint16_t)len;
+    memcpy(c->resp, buf, (size_t)len);
+    c->ts_ms    = proto_now_ms();
+    pthread_mutex_unlock(&g_dup_lock);
+}
+
+// 重发请求能否用缓存应答答复: 返回1=已回放, 0=不能用缓存(调用方仍按重复指令处理)
+static int dup_cache_replay(const command_t *command, uint64_t busy_since_ms) {
+    uint8_t buf[DUP_CACHE_RESP_MAX];
+    int len = 0;
+
+    if (command == NULL || !dup_cache_opcode_ok(command->opcode)) return 0;
+    if (command->req_fp_len == 0 || command->req_fp_len > DUP_CACHE_FP_MAX) return 0;
+
+    pthread_mutex_lock(&g_dup_lock);
+    dup_cache_t *c = &g_dup_cache[command->opcode];
+    uint64_t now = proto_now_ms();
+    if (c->valid &&
+        c->fp_len == command->req_fp_len &&
+        memcmp(c->fp, command->req_fp, command->req_fp_len) == 0 &&
+        c->ts_ms >= busy_since_ms &&
+        now >= c->ts_ms + DUP_CACHE_MIN_AGE_MS &&
+        now - c->ts_ms <= DUP_CACHE_MAX_AGE_MS) {
+        len = (int)c->resp_len;
+        memcpy(buf, c->resp, (size_t)len);
+    }
+    pthread_mutex_unlock(&g_dup_lock);
+
+    if (len <= 0) return 0;
+    if (app_send_response(command, buf, len) <= 0) return 0;
+    printf("[EXEC] 🔁 重发请求: 0x%02X 的原应答(%d 字节)已回放, 不再回 0xF1\n",
+           command->opcode, len);
+    return 1;
 }
 
 // ==================== 协议解析与命令分发 ====================
@@ -163,8 +270,25 @@ static int dispatch_task(threadpool_t *pool, void (*task_function)(void *),
         }
     }
 
+    // 请求指纹快照: 必须在分发时取。任务函数往往在回包前就 free(task_arg->data),
+    // 等到 app_send_response 时已经没有原始数据可比对了。
+    task_arg->req_fp_len = 0;
+    if (command->data != NULL && command->data_len > 0) {
+        uint32_t n = command->data_len > sizeof(task_arg->req_fp)
+                     ? (uint32_t)sizeof(task_arg->req_fp) : command->data_len;
+        memcpy(task_arg->req_fp, command->data, n);
+        task_arg->req_fp_len = (uint8_t)n;
+    }
+
     // 单飞去重: 同一操作码正在执行时, 不再新开线程执行
     if (opcode_try_acquire(task_arg->opcode) == 0) {
+        // 优先尝试回放上次的应答: 上位机"超时后重发"是最常见的重复来源,
+        // 直接回 0xF1 会让它等的那条应答永远不到(实锤导致标定步骤必然失败)。
+        if (dup_cache_replay(task_arg, opcode_busy_since(task_arg->opcode))) {
+            free(task_arg->data);
+            free(task_arg);
+            return -3;   // -3 表示重发请求已用缓存应答答复
+        }
         printf("[EXEC] ⚠️ 0x%02X 正在执行中, 重复指令已丢弃\n", task_arg->opcode);
         send_error_reply(command, 0xF1, task_arg->opcode);
         free(task_arg->data);
@@ -212,8 +336,10 @@ static int dispatch_command_if_len_ok(threadpool_t *pool, const command_t *comma
         return -1;
     }
     int rc = dispatch_task(pool, task_function, command);
-    if (rc == -2) {
-        // 该操作码正在执行中, 重复指令已丢弃(不算错误, 不回包)
+    if (rc == -2 || rc == -3) {
+        // -2: 该操作码正在执行中, 重复指令已丢弃
+        // -3: 该操作码正在执行中, 但重发请求已用上次应答回放
+        // 两种情况都已自行回包(或有意不回), 不算错误
         return 0;
     }
     if (rc != 0) {
@@ -442,6 +568,9 @@ int app_send_response(const command_t *command, const uint8_t *buf, int len) {
         return -1;
     }
 
+    // 记录本次应答: 上位机若没收到而重发同一条命令, 可以用它回放(见 dup_cache_store)
+    dup_cache_store(command, buf, len);
+
     if (command->channel == RESPONSE_CHANNEL_RS485) {
         if (command->serial_port == NULL) {
             printf("[REPLY] ❌ 回包失败: RS485 通道的串口句柄为空\n");
@@ -478,11 +607,28 @@ void protocol_parser_init(protocol_parser_t *parser) {
     parser->state = PROTOCOL_PARSE_HEADER;
     parser->need = 2;
     parser->len = 0;
-    parser->parse_start = 0;   // IDLE 状态, 不计时
+    parser->parse_start_ms = 0;   // IDLE 状态, 不计时
+    // 注意: 不重置 timeout_ms —— 每收完一帧都会调用本函数, 若在这里恢复默认值,
+    // 485 通道设置的短超时会被悄悄改回 TCP 的 1000ms。
+    if (parser->timeout_ms == 0 || parser->timeout_ms > PARSE_TIMEOUT_MS_MAX) {
+        parser->timeout_ms = PARSE_TIMEOUT_MS;
+    }
     parser->command.is_valid = 0;
     parser->command.opcode = 0;
     parser->command.data = NULL;
     parser->command.data_len = 0;
+    parser->command.req_fp_len = 0;
+}
+
+// 设置本通道的残帧超时(必须在 protocol_parser_init 之后调用)
+void protocol_parser_set_timeout(protocol_parser_t *parser, uint32_t ms) {
+    if (parser == NULL) {
+        return;
+    }
+    if (ms == 0 || ms > PARSE_TIMEOUT_MS_MAX) {
+        ms = PARSE_TIMEOUT_MS;
+    }
+    parser->timeout_ms = ms;
 }
 
 // 收齐一个完整命令包后调用: 执行命令
@@ -533,6 +679,13 @@ void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int le
         return;
     }
 
+    // 每收到一批字节就为残帧计时续期: 这是"字节间超时"(inter-byte), 不是"整帧超时",
+    // 所以慢慢到达但一直在推进的长帧不会被误杀。
+    uint64_t now = proto_now_ms();
+    if (parser->state != PROTOCOL_PARSE_HEADER || parser->len > 0) {
+        parser->parse_start_ms = now;
+    }
+
     for (int i = 0; i < len; i++) {
         const uint8_t byte = data[i];
         switch (parser->state) {
@@ -546,7 +699,7 @@ void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int le
                     parser->buf[parser->len++] = byte;
                     parser->state = PROTOCOL_PARSE_LEN;
                     parser->need = 4;
-                    parser->parse_start = time(NULL);   // 开始计时
+                    parser->parse_start_ms = now;   // 开始计时
                 } else {
                     parser->len = 0;
                     if (byte == 0xAB) {
@@ -605,12 +758,14 @@ void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int le
 
 // 检查解析器是否超时: 返回1=超时(调用方应重置parser), 0=正常
 int protocol_parser_check_timeout(protocol_parser_t *parser) {
-    if (parser == NULL || parser->parse_start == 0) {
+    if (parser == NULL || parser->parse_start_ms == 0) {
         return 0;   // IDLE 状态, 不需要检查
     }
-    if (time(NULL) - parser->parse_start >= PARSE_TIMEOUT_SEC) {
-        printf("[PARSE] ⚠️ 解析超时: 状态=%d, 已收 %u 字节, 未收齐整包, 解析器已重置\n",
-               parser->state, (unsigned)parser->len);
+    uint64_t now = proto_now_ms();
+    uint32_t limit = (parser->timeout_ms == 0) ? PARSE_TIMEOUT_MS : parser->timeout_ms;
+    if (now >= parser->parse_start_ms && now - parser->parse_start_ms >= (uint64_t)limit) {
+        printf("[PARSE] ⚠️ 解析超时: 状态=%d, 已收 %u 字节, %ums 未续上, 解析器已重置\n",
+               parser->state, (unsigned)parser->len, (unsigned)limit);
         return 1;
     }
     return 0;

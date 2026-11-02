@@ -10,7 +10,14 @@
 #define PROTOCOL_CHECKSUM_SIZE 2
 #define PROTOCOL_DATA_OFFSET   (PROTOCOL_HEADER_SIZE + PROTOCOL_CHECKSUM_SIZE)
 #define MAX_PACKET_SIZE       2048
-#define PARSE_TIMEOUT_SEC      1   // 解析超时: 5秒内未收完一帧则重置
+
+// 解析超时(自上次收到字节起, 多久还没收满一帧就判定残帧并重置状态机)
+// [2026-11-02] 改为毫秒级 + 每通道可配:
+//   原先用 time(NULL) 只有 1 秒粒度, 且 485 通道根本没有调用超时检查,
+//   丢一个字节后残帧会把后续命令的字节当成本帧数据咽掉 -> 整条链路静默失效。
+#define PARSE_TIMEOUT_MS       1000   // TCP: 1s 未收完一帧则重置
+#define PARSE_TIMEOUT_MS_485    300   // 485: 半双工短命令, 一帧几十字节, 300ms 足够
+#define PARSE_TIMEOUT_MS_MAX  60000   // 非法配置的上限保护
 
 // 命令来源通道 (0 = TCP 客户端, 1 = RS-485 总线)
 #define RESPONSE_CHANNEL_TCP   0
@@ -25,6 +32,11 @@ typedef struct {
     int      channel;       // 命令来源通道 (RESPONSE_CHANNEL_TCP / RESPONSE_CHANNEL_RS485)
     int    tcp_fd;               // TCP: 目标客户端 fd
     void  *serial_port;          // 485: 串口句柄
+    // 请求数据指纹: 分发任务时对 data 前 8 字节做的快照。
+    // 用途: 重发请求(上位机超时重试)时, 只有指纹与原请求一致才允许回放上次应答。
+    // 注意: 任务函数常在回包前就 free(data), 所以指纹必须在分发时取, 不能在回包时取。
+    uint8_t  req_fp[8];
+    uint8_t  req_fp_len;
 } command_t;
 
 // 统一回包入口: 按命令来源路由到 TCP 或 485
@@ -47,7 +59,8 @@ typedef struct {
     protocol_parse_state_t state;
     uint32_t need;
     uint32_t len;
-    time_t   parse_start;   // 进入非IDLE状态时的时间戳, 0=IDLE
+    uint64_t parse_start_ms;   // 进入非IDLE状态时的单调时钟(ms), 0=IDLE
+    uint32_t timeout_ms;       // 本通道的残帧超时(0=用默认值)
     uint8_t  buf[MAX_PACKET_SIZE];
     command_t command;      
 } protocol_parser_t;
@@ -55,5 +68,6 @@ typedef struct {
 void protocol_parser_init(protocol_parser_t *parser);
 void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int len);
 int  protocol_parser_check_timeout(protocol_parser_t *parser);  // 返回1=超时需重置
+void protocol_parser_set_timeout(protocol_parser_t *parser, uint32_t ms); // 设置本通道残帧超时
 void send_error_reply(const command_t *command, uint8_t reply_opcode, uint8_t err_opcode);
 #endif // PROTOCOL_H
