@@ -26,8 +26,6 @@ static pthread_mutex_t g_exec_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t         g_opcode_busy[OPCODE_MAX];
 static uint64_t        g_opcode_busy_since[OPCODE_MAX];   // 本次占用开始时刻(ms)
 
-<<<<<<< Updated upstream
-=======
 // [2026-11-02] 兜底补救钩子: 当"刚执行完的帧 + 2 字节尾巴"这一特征出现时,
 //   交给 task.c 判断是不是上位机的 0x23 帧没整帧重建(见 task.c 里的详细说明)。
 //   刻意用 extern 声明而**不写进头文件**: 头文件不同步时也能编译通过。
@@ -44,7 +42,6 @@ static uint64_t g_last_exec_ms = 0;
 //   改成静态量后, 解析器代码对头文件没有任何新增依赖。
 static uint64_t        g_parse_discarded = 0;
 
->>>>>>> Stashed changes
 // 单调时钟(ms): 只用于算时间差, 不受系统改时间影响
 static uint64_t proto_now_ms(void) {
     struct timespec ts;
@@ -712,10 +709,7 @@ void protocol_parser_init(protocol_parser_t *parser) {
     parser->state = PROTOCOL_PARSE_HEADER;
     parser->need = 0;
     parser->len = 0;
-<<<<<<< Updated upstream
-=======
     // 注意: g_parse_discarded 是全局累计量, 不随解析器重置(它只用于日志统计)
->>>>>>> Stashed changes
     parser->parse_start_ms = 0;   // IDLE 状态, 不计时
     // 注意: 不重置 timeout_ms —— 每收完一帧都会调用本函数, 若在这里恢复默认值,
     // 485 通道设置的短超时会被悄悄改回 TCP 的 1000ms。
@@ -727,20 +721,6 @@ void protocol_parser_init(protocol_parser_t *parser) {
     parser->command.data = NULL;
     parser->command.data_len = 0;
     parser->command.req_fp_len = 0;
-<<<<<<< Updated upstream
-}
-
-// 设置本通道的残帧超时(必须在 protocol_parser_init 之后调用)
-void protocol_parser_set_timeout(protocol_parser_t *parser, uint32_t ms) {
-    if (parser == NULL) {
-        return;
-    }
-    if (ms == 0 || ms > PARSE_TIMEOUT_MS_MAX) {
-        ms = PARSE_TIMEOUT_MS;
-    }
-    parser->timeout_ms = ms;
-=======
->>>>>>> Stashed changes
 }
 
 // 设置本通道的残帧超时(必须在 protocol_parser_init 之后调用)
@@ -941,82 +921,6 @@ void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int le
         return;
     }
 
-<<<<<<< Updated upstream
-    // 每收到一批字节就为残帧计时续期: 这是"字节间超时"(inter-byte), 不是"整帧超时",
-    // 所以慢慢到达但一直在推进的长帧不会被误杀。
-    uint64_t now = proto_now_ms();
-    if (parser->state != PROTOCOL_PARSE_HEADER || parser->len > 0) {
-        parser->parse_start_ms = now;
-    }
-
-    for (int i = 0; i < len; i++) {
-        const uint8_t byte = data[i];
-        switch (parser->state) {
-        case PROTOCOL_PARSE_HEADER:
-            if (parser->len == 0) {
-                if (byte == 0xAB) {
-                    parser->buf[parser->len++] = byte;
-                }
-            } else {
-                if (byte == 0xCD) {
-                    parser->buf[parser->len++] = byte;
-                    parser->state = PROTOCOL_PARSE_LEN;
-                    parser->need = 4;
-                    parser->parse_start_ms = now;   // 开始计时
-                } else {
-                    parser->len = 0;
-                    if (byte == 0xAB) {
-                        parser->buf[parser->len++] = byte;
-                    }
-                }
-            }
-            break;
-
-        case PROTOCOL_PARSE_LEN:
-            parser->buf[parser->len++] = byte;
-            if (--parser->need == 0) {
-                parser->command.data_len = ((uint32_t)parser->buf[2] << 24) |
-                                           ((uint32_t)parser->buf[3] << 16) |
-                                           ((uint32_t)parser->buf[4] << 8) |
-                                           parser->buf[5];
-                if (parser->command.data_len >
-                    MAX_PACKET_SIZE - PROTOCOL_HEADER_SIZE - PROTOCOL_CHECKSUM_SIZE) {
-                    printf("[PARSE] ❌ 包长度非法: data_len=%u 超出上限, 已丢弃并重新同步\n",
-                           (unsigned)parser->command.data_len);
-                    protocol_parser_init(parser);
-                    break;
-                }
-                parser->state = PROTOCOL_PARSE_OPCODE;
-                parser->need = 1;
-            }
-            break;
-
-        case PROTOCOL_PARSE_OPCODE:
-            parser->buf[parser->len++] = byte;
-            parser->command.opcode = byte;
-            parser->state = PROTOCOL_PARSE_CHECKSUM;
-            parser->need = PROTOCOL_CHECKSUM_SIZE;
-            break;
-
-        case PROTOCOL_PARSE_CHECKSUM:
-            parser->buf[parser->len++] = byte;
-            if (--parser->need == 0) {
-                parser->state = PROTOCOL_PARSE_DATA;
-                parser->need = parser->command.data_len;
-                if (parser->need == 0) {
-                    protocol_parser_verify_packet(parser);
-                }
-            }
-            break;
-
-        case PROTOCOL_PARSE_DATA:
-            parser->buf[parser->len++] = byte;
-            if (--parser->need == 0) {
-                protocol_parser_verify_packet(parser);
-            }
-            break;
-        }
-=======
     // 单批就超过缓冲: 只留最后 MAX_PACKET_SIZE 字节(一帧最长也就这么多), 保证还能继续同步
     if (len > MAX_PACKET_SIZE) {
         printf("[PARSE] ⚠️ 单批收到 %d 字节, 超过缓冲上限 %d, 只保留尾部\n",
@@ -1024,7 +928,6 @@ void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int le
         data += (len - MAX_PACKET_SIZE);
         len = MAX_PACKET_SIZE;
         parser->len = 0;
->>>>>>> Stashed changes
     }
 
     // 缓冲不够: 丢掉最老的字节(滑动), 绝不让缓冲溢出把解析器卡死
@@ -1056,26 +959,17 @@ void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int le
 //   调用方只需 `if (protocol_parser_check_timeout(&p)) { ...打日志/计数... }`,
 //   不需要再调用任何新接口 —— 这样即使 include/protocol.h 没同步也不会编译失败。
 int protocol_parser_check_timeout(protocol_parser_t *parser) {
-<<<<<<< Updated upstream
-    if (parser == NULL || parser->parse_start_ms == 0) {
-=======
     if (parser == NULL || parser->parse_start_ms == 0 || parser->len == 0) {
->>>>>>> Stashed changes
         return 0;   // IDLE 状态, 不需要检查
     }
     uint64_t now = proto_now_ms();
     uint32_t limit = (parser->timeout_ms == 0) ? PARSE_TIMEOUT_MS : parser->timeout_ms;
     if (now >= parser->parse_start_ms && now - parser->parse_start_ms >= (uint64_t)limit) {
-<<<<<<< Updated upstream
-        printf("[PARSE] ⚠️ 解析超时: 状态=%d, 已收 %u 字节, %ums 未续上, 解析器已重置\n",
-               parser->state, (unsigned)parser->len, (unsigned)limit);
-=======
         printf("[PARSE] ⚠️ 残帧超时: 缓冲 %u 字节 %ums 没续上(还差 %u 字节), 重新同步"
                "(累计丢弃 %llu 字节)\n",
                (unsigned)parser->len, (unsigned)limit, (unsigned)parser->need,
                (unsigned long long)g_parse_discarded);
         protocol_parser_flush_stale(parser);   // 只丢残帧, 保住残帧后面的完好命令
->>>>>>> Stashed changes
         return 1;
     }
     return 0;

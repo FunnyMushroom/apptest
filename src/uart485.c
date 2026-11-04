@@ -108,12 +108,6 @@ static void *uart485_rx_loop(void *arg)
         //   (只有 tcpserver 的 TCP 解析器每轮检查), 后果: 只要丢一个字节, 状态机就
         //   停在中途等"剩下的字节", 把后续每一条命令的字节都当成本帧的数据吞掉,
         //   表现为"上位机连续发命令, 下位机部分命令毫无反应", 直到重启进程。
-<<<<<<< Updated upstream
-        if (protocol_parser_check_timeout(&g_parser)) {
-            protocol_parser_init(&g_parser);   // 丢弃残帧, 重新等 0xAB 0xCD
-            g_stat_resync++;
-            printf("[485] ⚠️ 残帧已丢弃并重新同步 (累计 %lu 次)\n", g_stat_resync);
-=======
         // [2026-11-02 二次修复] 超时后不再 protocol_parser_init(整包清空), 而是
         //   只丢到下一个 AB CD 帧头处再继续解析 —— 残帧后面紧跟着的
         //   0x1D 之类的完好命令还能被救回来, 不会因为前一帧被截断就整步失败。
@@ -121,7 +115,6 @@ static void *uart485_rx_loop(void *arg)
         if (protocol_parser_check_timeout(&g_parser)) {
             g_stat_resync++;
             printf("[485] ⚠️ 残帧已重新同步 (累计 %lu 次)\n", g_stat_resync);
->>>>>>> Stashed changes
         }
     }
 
