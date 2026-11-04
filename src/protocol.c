@@ -26,6 +26,25 @@ static pthread_mutex_t g_exec_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t         g_opcode_busy[OPCODE_MAX];
 static uint64_t        g_opcode_busy_since[OPCODE_MAX];   // 本次占用开始时刻(ms)
 
+<<<<<<< Updated upstream
+=======
+// [2026-11-02] 兜底补救钩子: 当"刚执行完的帧 + 2 字节尾巴"这一特征出现时,
+//   交给 task.c 判断是不是上位机的 0x23 帧没整帧重建(见 task.c 里的详细说明)。
+//   刻意用 extern 声明而**不写进头文件**: 头文件不同步时也能编译通过。
+extern int task_rescue_broken_set_channels(command_t *cmd, const uint8_t *tail, int tail_len);
+
+// 最近一次成功执行的帧(用于上面那个特征判断): 操作码 + 时刻
+static uint8_t  g_last_exec_op = 0;
+static uint64_t g_last_exec_ms = 0;
+
+// 滑动重同步累计丢弃的字节数(仅用于日志)。
+// [2026-11-02] 刻意做成文件级静态量, 而不是 protocol_parser_t 的成员:
+//   这个统计只有日志价值, 放进结构体就要求 include/protocol.h 必须跟着一起同步,
+//   一旦头文件没同步到位(比如只拷贝了 src/), 整个工程直接编译不过。
+//   改成静态量后, 解析器代码对头文件没有任何新增依赖。
+static uint64_t        g_parse_discarded = 0;
+
+>>>>>>> Stashed changes
 // 单调时钟(ms): 只用于算时间差, 不受系统改时间影响
 static uint64_t proto_now_ms(void) {
     struct timespec ts;
@@ -352,6 +371,80 @@ static int dispatch_command_if_len_ok(threadpool_t *pool, const command_t *comma
     return 0;
 }
 
+// ==================== 接收线程内同步执行(时序确定性) ====================
+// [2026-11-02 二次修复] 为什么需要它:
+//   0x0D/0x1B/0x23 是"每个测试点开头必发的三条短命令", 原来都投进线程池。
+//   线程池调度有 2~12ms 的抖动(实测同一份日志里 0x0D 的应答时延 4~12ms),
+//   后果有两个:
+//     1) 上位机的步骤超时判据被这抖动撞上 -> 重发 -> 时序越滚越乱;
+//     2) 更要命的是 0x23(入队) 与 0x1D(开始扫描) 落在两个线程上, 先后没有保证:
+//        一旦 0x1D 先跑, 队列还是空的, 而扫描开头又要"采集期间 PD14/PD15 必须为低",
+//        于是拉低动作被推到扫描开始之后 -> 上位机认为本轮已结束 / 前若干点读到 0V。
+//   这三条命令本身都在 1~4ms 内完成, 直接在接收线程里同步执行即可:
+//     - 应答时延变成确定值(收到命令后 1~2ms 内必回);
+//     - 0x24 必定在 0x1D 之前发出, 0x1D 到达时队列必定就绪 —— 顺序天然成立。
+static int dispatch_command_inline_if_len_ok(const command_t *command,
+                                             uint32_t expected_len,
+                                             void (*task_function)(void *),
+                                             const char *command_name) {
+    if (command->data_len != expected_len) {
+        printf("[EXEC] ❌ 0x%02X (%s) 参数长度不合法: 实际 %u 字节, 期望 %u 字节\n",
+               command->opcode, command_name, (unsigned)command->data_len,
+               (unsigned)expected_len);
+        send_error_reply(command, 0xf3, command->opcode);
+        return -1;
+    }
+
+    uint8_t opcode = command->opcode;
+    command_t *task_arg = (command_t *)calloc(1, sizeof(*task_arg));
+    if (task_arg == NULL) {
+        printf("[EXEC] ❌ 分发任务失败: 分配 task_arg 内存出错 (0x%02X)\n", opcode);
+        return -1;
+    }
+    task_arg->is_valid    = command->is_valid;
+    task_arg->opcode      = command->opcode;
+    task_arg->data_len    = command->data_len;
+    task_arg->channel     = command->channel;
+    task_arg->tcp_fd      = command->tcp_fd;
+    task_arg->serial_port = command->serial_port;
+    task_arg->data        = NULL;
+    if (command->data_len > 0) {
+        task_arg->data = duplicate_task_data(command->data, command->data_len);
+        if (task_arg->data == NULL) {
+            printf("[EXEC] ❌ 分发任务失败: 复制命令负载数据出错 (0x%02X)\n", opcode);
+            free(task_arg);
+            return -1;
+        }
+    }
+    task_arg->req_fp_len = 0;
+    if (command->data != NULL && command->data_len > 0) {
+        uint32_t n = command->data_len > sizeof(task_arg->req_fp)
+                     ? (uint32_t)sizeof(task_arg->req_fp) : command->data_len;
+        memcpy(task_arg->req_fp, command->data, n);
+        task_arg->req_fp_len = (uint8_t)n;
+    }
+
+    if (opcode_try_acquire(opcode) == 0) {
+        if (dup_cache_replay(task_arg, opcode_busy_since(opcode))) {
+            free(task_arg->data);
+            free(task_arg);
+            return 0;
+        }
+        printf("[EXEC] ⚠️ 0x%02X 正在执行中, 重复指令已丢弃\n", opcode);
+        send_error_reply(command, 0xF1, opcode);
+        free(task_arg->data);
+        free(task_arg);
+        return 0;
+    }
+
+    // 同步执行: 任务函数自己负责 free(task_arg)
+    printf("[EXEC] ✅ 0x%02X (%s) 接收线程内同步执行(应答与后续命令严格有序)\n",
+           opcode, command_name);
+    task_function(task_arg);
+    opcode_release(opcode);
+    return 0;
+}
+
 static int execute_command(const command_t *command) {
     if (g_thread_pool == NULL || command == NULL) {
         printf("[EXEC] ❌ 执行命令失败: 线程池或命令为 NULL\n");
@@ -405,8 +498,9 @@ static int execute_command(const command_t *command) {
             break;
 
         // ---------- 6. 增益 ----------
+        // [2026-11-02] 改接收线程内同步执行(应答时延确定, 见 dispatch_command_inline_if_len_ok)
         case 0x0D:
-            if (dispatch_command_if_len_ok(g_thread_pool, command, 1,
+            if (dispatch_command_inline_if_len_ok(command, 1,
                     Task_Set_Buff, "set_gain") != 0)
                 return -1;
             break;
@@ -452,7 +546,8 @@ static int execute_command(const command_t *command) {
         //     break;
 
         case 0x1B:
-            if (dispatch_command_if_len_ok(g_thread_pool, command, 2,
+            // [2026-11-02] 同步执行: 只写一个全局变量+回包, 微秒级完成
+            if (dispatch_command_inline_if_len_ok(command, 2,
                     Task_Test_Read_ADC121_Times, "set_adc_times") != 0)
                 return -1;
             break;
@@ -480,8 +575,18 @@ static int execute_command(const command_t *command) {
                 return -1;
             break;
         case 0x23:
-        if (dispatch_command_if_len_ok(g_thread_pool, command, 4,
-            Task_Set_Scan_Channels, "scan") != 0)
+            // [2026-11-02] 同步执行: 必须保证"入队 + 回 0x24"都发生在 0x1D 被解析之前,
+            //   否则扫描可能在队列还空着时启动(以及 PD14/PD15 的拉低被推迟到扫描开始之后)。
+            // [2026-11-03] 数据改为 5 字节: collect(2) + switch(2) + 频率系数(1, ×10kHz);
+            //   兼容旧格式 4 字节(不含频率 = 不修改频率), 两者都放行, 由任务内部区分。
+            if (command->data_len != 5 && command->data_len != 4) {
+                printf("[EXEC] ❌ 0x23 (scan) 参数长度不合法: 实际 %u 字节, 期望 4 或 5 字节\n",
+                       (unsigned)command->data_len);
+                send_error_reply(command, 0xf3, command->opcode);
+                return -1;
+            }
+            if (dispatch_command_inline_if_len_ok(command, command->data_len,
+                    Task_Set_Scan_Channels, "scan") != 0)
                 return -1;
             break;
         case 0x25:
@@ -605,8 +710,12 @@ void protocol_parser_init(protocol_parser_t *parser) {
         return;
     }
     parser->state = PROTOCOL_PARSE_HEADER;
-    parser->need = 2;
+    parser->need = 0;
     parser->len = 0;
+<<<<<<< Updated upstream
+=======
+    // 注意: g_parse_discarded 是全局累计量, 不随解析器重置(它只用于日志统计)
+>>>>>>> Stashed changes
     parser->parse_start_ms = 0;   // IDLE 状态, 不计时
     // 注意: 不重置 timeout_ms —— 每收完一帧都会调用本函数, 若在这里恢复默认值,
     // 485 通道设置的短超时会被悄悄改回 TCP 的 1000ms。
@@ -618,6 +727,20 @@ void protocol_parser_init(protocol_parser_t *parser) {
     parser->command.data = NULL;
     parser->command.data_len = 0;
     parser->command.req_fp_len = 0;
+<<<<<<< Updated upstream
+}
+
+// 设置本通道的残帧超时(必须在 protocol_parser_init 之后调用)
+void protocol_parser_set_timeout(protocol_parser_t *parser, uint32_t ms) {
+    if (parser == NULL) {
+        return;
+    }
+    if (ms == 0 || ms > PARSE_TIMEOUT_MS_MAX) {
+        ms = PARSE_TIMEOUT_MS;
+    }
+    parser->timeout_ms = ms;
+=======
+>>>>>>> Stashed changes
 }
 
 // 设置本通道的残帧超时(必须在 protocol_parser_init 之后调用)
@@ -631,54 +754,194 @@ void protocol_parser_set_timeout(protocol_parser_t *parser, uint32_t ms) {
     parser->timeout_ms = ms;
 }
 
-// 收齐一个完整命令包后调用: 执行命令
-static void protocol_parser_on_packet(protocol_parser_t *parser) {
-    if (g_thread_pool == NULL) {
-        printf("[PARSE] ❌ 处理命令包失败: 全局线程池未初始化\n");
-        protocol_parser_init(parser);
+// ==================== 流式解析: 滑动窗口扫描 ====================
+// [2026-11-02 二次修复] 原来的"状态机 + 收齐整包才校验"存在一个致命缺陷:
+//   线上偶尔出现**尾部被截掉 2 字节**的帧(实测 2026_11_02_1_scan.log 4 次/7 轮)。
+//   状态机于是停在 DATA 态等"剩下的 2 字节", 把随后到达的下一条命令(例如 0x1D)
+//   的前 2 个字节当成残缺帧的数据咽掉, 随后校验失败 -> 整条命令丢失, 上位机一直等到超时。
+//   现象就是"命令时快时慢、偶尔整步失败"。
+//
+// 新做法: 收到的字节全部进缓冲, 然后在一个循环里:
+//   1) 对齐帧头 AB CD(不是就丢掉 1 字节继续找);
+//   2) 头齐了算 data_len, 数据没齐就等下一批字节;
+//   3) 数据齐了就校验; 校验失败**只丢 1 字节**继续找下一个帧头(不再整包丢弃);
+//   4) 校验通过就执行, 然后从缓冲里移走这一帧。
+// 这样任何粘包/拆包/残帧/多字节垃圾都只影响它自己, 再也不会"吞掉后续命令"。
+
+// 从缓冲头部丢弃 n 字节
+static void parser_consume(protocol_parser_t *parser, uint32_t n) {
+    if (n >= parser->len) {
+        parser->len = 0;
         return;
     }
+    memmove(parser->buf, parser->buf + n, (size_t)(parser->len - n));
+    parser->len -= n;
+}
 
+// 执行一个已通过校验的完整帧(位于 buf[0..total)), 由调用方负责随后移出缓冲
+static void parser_exec_frame(protocol_parser_t *parser, uint32_t total) {
     parser->command.is_valid = 1;
-    parser->command.data = parser->buf + PROTOCOL_DATA_OFFSET;
+    parser->command.opcode   = parser->buf[PROTOCOL_HEADER_SIZE - 1];
+    parser->command.data_len = total - PROTOCOL_DATA_OFFSET;
+    parser->command.data     = parser->buf + PROTOCOL_DATA_OFFSET;
 
     // 打印：解析到完整命令，显示操作码和数据长度
     printf("[PARSE] ✅ 收到完整命令: opcode=0x%02X, 数据长度=%u 字节\n",
            parser->command.opcode, (unsigned)parser->command.data_len);
 
-    if (execute_command(&parser->command) != 0) {
+    if (g_thread_pool == NULL) {
+        printf("[PARSE] ❌ 处理命令包失败: 全局线程池未初始化\n");
+    } else if (execute_command(&parser->command) != 0) {
         printf("[PARSE] ❌ 命令执行失败: opcode=0x%02X\n", parser->command.opcode);
     }
 
-    protocol_parser_init(parser);
+    parser->command.is_valid = 0;
+    parser->command.data     = NULL;
+    parser->command.data_len = 0;
 }
 
-// 整包收齐后校验 checksum: 通过则执行命令, 失败则丢弃本包并重新同步
-static void protocol_parser_verify_packet(protocol_parser_t *parser) {
-    uint16_t received_checksum = ((uint16_t)parser->buf[PROTOCOL_HEADER_SIZE] << 8) |
-                                 (uint16_t)parser->buf[PROTOCOL_HEADER_SIZE + 1];
-    uint16_t calculated_checksum = compute_checksum(parser->buf, parser->len);
+// 扫描缓冲: 能凑出完整且校验正确的帧就执行, 否则滑动窗口重新找帧头
+static void protocol_parser_scan(protocol_parser_t *parser) {
+    for (;;) {
+        if (parser->len < 2) {
+            // 只剩 1 字节: 不是 0xAB 就丢掉, 是 0xAB 就留着等下一字节
+            if (parser->len == 1 && parser->buf[0] != 0xAB) {
+                g_parse_discarded++;
+                parser_consume(parser, 1);
+                continue;
+            }
+            break;
+        }
 
-    if (received_checksum != calculated_checksum) {
-        // 打印：校验和不匹配，显示收到的校验码和计算出的校验码
-        printf("[PARSE] ❌ 校验和不匹配: 收到=0x%04X, 计算=0x%04X, 本包已丢弃\n",
-               received_checksum, calculated_checksum);
-        send_error_reply(&parser->command,0xf2,parser->command.opcode);
-        protocol_parser_init(parser);
+        // 1) 对齐帧头
+        if (parser->buf[0] != 0xAB || parser->buf[1] != 0xCD) {
+            uint32_t drop = 1;
+            while (drop < parser->len && parser->buf[drop] != 0xAB) {
+                drop++;
+            }
+            // [2026-11-02] "刚执行的帧 + 2~3 字节尾巴" = 上位机发送缓冲区没整帧重建的
+            //   特征(现场 0x1B 后面跟 06 Cx)。交给 task.c 尝试补救:
+            //   返回 1 = 已按真正的意图入队并回包 0x24, 这些字节已消费完。
+            //   返回 0 = 没补救(开关关闭/判据不符), 按错位数据正常丢弃。
+            //   [2026-11-03] 0x23 改为 5 字节后尾巴可能是 3 字节(开关卡2+频率1), 一并交给
+            //   task.c 判断(补救路径只用前 2 字节, 频率字节丢弃)。
+            if ((parser->len == 2 || parser->len == 3) && drop == parser->len &&
+                g_last_exec_op == 0x1B &&
+                g_last_exec_ms != 0 && proto_now_ms() - g_last_exec_ms < 1000 &&
+                task_rescue_broken_set_channels(&parser->command, parser->buf, (int)parser->len) == 1) {
+                g_last_exec_op = 0;
+                parser_consume(parser, parser->len);
+                continue;
+            }
+            if (drop > 1) {
+                printf("[PARSE] ⚠️ 丢弃 %u 字节错位数据, 重新找帧头 AB CD\n", (unsigned)drop);
+            }
+            g_parse_discarded += drop;
+            parser_consume(parser, drop);
+            continue;
+        }
+
+        // 2) 头(2+4+1+2=9 字节)是否收齐
+        if (parser->len < PROTOCOL_DATA_OFFSET) {
+            parser->need = PROTOCOL_DATA_OFFSET - parser->len;
+            break;
+        }
+
+        uint32_t dl = ((uint32_t)parser->buf[2] << 24) | ((uint32_t)parser->buf[3] << 16) |
+                      ((uint32_t)parser->buf[4] << 8)  |  (uint32_t)parser->buf[5];
+        if (dl > (uint32_t)(MAX_PACKET_SIZE - PROTOCOL_DATA_OFFSET)) {
+            printf("[PARSE] ❌ 包长度非法: data_len=%u 超出上限, 丢弃帧头继续找\n", (unsigned)dl);
+            g_parse_discarded++;
+            parser_consume(parser, 1);
+            continue;
+        }
+
+        uint32_t total = (uint32_t)PROTOCOL_DATA_OFFSET + dl;
+        if (parser->len < total) {
+            parser->need = total - parser->len;   // 数据未齐, 等后续字节(超时由上层兜底)
+            break;
+        }
+
+        // 3) 校验: 失败只丢 1 字节, 不整包丢弃 —— 后面可能还藏着一个好帧
+        uint16_t received_checksum = ((uint16_t)parser->buf[PROTOCOL_HEADER_SIZE] << 8) |
+                                     (uint16_t)parser->buf[PROTOCOL_HEADER_SIZE + 1];
+        uint16_t calculated_checksum = compute_checksum(parser->buf, total);
+        if (received_checksum != calculated_checksum) {
+            printf("[PARSE] ❌ 校验和不匹配: 收到=0x%04X, 计算=0x%04X (op=0x%02X, len=%u) "
+                   "-> 只丢 1 字节继续找帧头, 不再整包丢弃\n",
+                   received_checksum, calculated_checksum, parser->buf[6], (unsigned)dl);
+            g_parse_discarded++;
+            parser_consume(parser, 1);
+            continue;
+        }
+
+        // 4) 执行并移出缓冲
+        g_last_exec_op = parser->buf[6];
+        g_last_exec_ms = proto_now_ms();
+        parser_exec_frame(parser, total);
+        parser_consume(parser, total);
+    }
+
+    parser->need = parser->len;
+}
+
+// 残帧超时后调用: 丢到"下一个 AB CD 帧头"处再重新扫描。
+// 不能直接清空缓冲 —— 残帧后面往往紧跟着一条完好的命令(例如 0x1D), 直接清空就把人丢了。
+// [2026-11-02] 由 protocol_parser_check_timeout() 内部调用, 不再需要调用方手动调用。
+//   两点刻意设计, 都是为了让"只同步了部分文件"也能编过:
+//   1) 不在 include/protocol.h 里声明 —— 头文件没同步时, 调用方不会出现隐式声明问题;
+//   2) 保留外部链接(不加 static) —— 万一某个调用方文件还是旧版(仍在手动调用它),
+//      链接时依然找得到符号, 不会变成 undefined reference。
+void protocol_parser_flush_stale(protocol_parser_t *parser) {
+    if (parser == NULL || parser->len == 0) {
         return;
     }
 
-    protocol_parser_on_packet(parser);
+    uint32_t idx = 0;
+    for (uint32_t i = 1; i + 1 < parser->len; i++) {
+        if (parser->buf[i] == 0xAB && parser->buf[i + 1] == 0xCD) {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx > 0) {
+        printf("[PARSE]   ↳ 残帧后找到新帧头(偏移 %u), 丢弃前面的残字节并继续解析\n",
+               (unsigned)idx);
+        g_parse_discarded += idx;
+        parser_consume(parser, idx);
+        protocol_parser_scan(parser);
+        // 重新起算: 剩下的字节属于"新帧", 给它们一个完整的超时窗口,
+        // 否则 parse_start_ms 还是旧的, 下一轮会立刻再次判定超时。
+        parser->parse_start_ms = (parser->len > 0) ? proto_now_ms() : 0;
+        parser->state = (parser->len > 0) ? PROTOCOL_PARSE_DATA : PROTOCOL_PARSE_HEADER;
+        parser->need = parser->len;
+        return;
+    }
+
+    // 没有完整帧头: 末尾若是 0xAB 就留着当下一帧起点, 其余全部丢弃
+    uint8_t keep = (parser->buf[parser->len - 1] == 0xAB) ? 1u : 0u;
+    g_parse_discarded += parser->len - keep;
+    parser->len = keep;
+    if (keep) {
+        parser->buf[0] = 0xAB;
+    }
+    // 不论是否留了一个 0xAB, 都停止计时: 否则只剩一个 0xAB 时会每 80ms "超时"打印一次。
+    // 新字节到达时 feed() 会重新开始计时。
+    parser->parse_start_ms = 0;
+    parser->state = PROTOCOL_PARSE_HEADER;
+    parser->need = parser->len;
 }
 
 
 
-// 向状态机喂入字节流; 支持粘包与拆包
+// 向解析器喂入字节流: 支持粘包/拆包/残帧, 实现见上面的协议扫描器
 void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int len) {
     if (parser == NULL || data == NULL || len <= 0) {
         return;
     }
 
+<<<<<<< Updated upstream
     // 每收到一批字节就为残帧计时续期: 这是"字节间超时"(inter-byte), 不是"整帧超时",
     // 所以慢慢到达但一直在推进的长帧不会被误杀。
     uint64_t now = proto_now_ms();
@@ -753,19 +1016,66 @@ void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int le
             }
             break;
         }
+=======
+    // 单批就超过缓冲: 只留最后 MAX_PACKET_SIZE 字节(一帧最长也就这么多), 保证还能继续同步
+    if (len > MAX_PACKET_SIZE) {
+        printf("[PARSE] ⚠️ 单批收到 %d 字节, 超过缓冲上限 %d, 只保留尾部\n",
+               len, MAX_PACKET_SIZE);
+        data += (len - MAX_PACKET_SIZE);
+        len = MAX_PACKET_SIZE;
+        parser->len = 0;
+>>>>>>> Stashed changes
     }
+
+    // 缓冲不够: 丢掉最老的字节(滑动), 绝不让缓冲溢出把解析器卡死
+    if (parser->len + (uint32_t)len > MAX_PACKET_SIZE) {
+        uint32_t overflow = parser->len + (uint32_t)len - MAX_PACKET_SIZE;
+        printf("[PARSE] ⚠️ 接收缓冲将溢出, 丢弃最老的 %u 字节\n", (unsigned)overflow);
+        g_parse_discarded += overflow;
+        parser_consume(parser, overflow);
+    }
+
+    memcpy(parser->buf + parser->len, data, (size_t)len);
+    parser->len += (uint32_t)len;
+
+    // 收到字节就为残帧计时续期: 这是"字节间超时"(inter-byte), 不是"整帧超时"
+    parser->parse_start_ms = proto_now_ms();
+    parser->state = PROTOCOL_PARSE_DATA;
+
+    protocol_parser_scan(parser);
+
+    if (parser->len == 0) {
+        parser->parse_start_ms = 0;                 // 缓冲已清空 -> 空闲, 不计时
+        parser->state = PROTOCOL_PARSE_HEADER;
+    }
+    parser->need = parser->len;                     // 兼容字段: 表示还有多少字节待处理
 }
 
-// 检查解析器是否超时: 返回1=超时(调用方应重置parser), 0=正常
+// 检查解析器是否超时: 返回1=已超时并完成重新同步, 0=正常
+// [2026-11-02] 重同步动作(flush_stale)已内联在本函数里:
+//   调用方只需 `if (protocol_parser_check_timeout(&p)) { ...打日志/计数... }`,
+//   不需要再调用任何新接口 —— 这样即使 include/protocol.h 没同步也不会编译失败。
 int protocol_parser_check_timeout(protocol_parser_t *parser) {
+<<<<<<< Updated upstream
     if (parser == NULL || parser->parse_start_ms == 0) {
+=======
+    if (parser == NULL || parser->parse_start_ms == 0 || parser->len == 0) {
+>>>>>>> Stashed changes
         return 0;   // IDLE 状态, 不需要检查
     }
     uint64_t now = proto_now_ms();
     uint32_t limit = (parser->timeout_ms == 0) ? PARSE_TIMEOUT_MS : parser->timeout_ms;
     if (now >= parser->parse_start_ms && now - parser->parse_start_ms >= (uint64_t)limit) {
+<<<<<<< Updated upstream
         printf("[PARSE] ⚠️ 解析超时: 状态=%d, 已收 %u 字节, %ums 未续上, 解析器已重置\n",
                parser->state, (unsigned)parser->len, (unsigned)limit);
+=======
+        printf("[PARSE] ⚠️ 残帧超时: 缓冲 %u 字节 %ums 没续上(还差 %u 字节), 重新同步"
+               "(累计丢弃 %llu 字节)\n",
+               (unsigned)parser->len, (unsigned)limit, (unsigned)parser->need,
+               (unsigned long long)g_parse_discarded);
+        protocol_parser_flush_stale(parser);   // 只丢残帧, 保住残帧后面的完好命令
+>>>>>>> Stashed changes
         return 1;
     }
     return 0;

@@ -16,7 +16,14 @@
 //   原先用 time(NULL) 只有 1 秒粒度, 且 485 通道根本没有调用超时检查,
 //   丢一个字节后残帧会把后续命令的字节当成本帧数据咽掉 -> 整条链路静默失效。
 #define PARSE_TIMEOUT_MS       1000   // TCP: 1s 未收完一帧则重置
+<<<<<<< Updated upstream
 #define PARSE_TIMEOUT_MS_485    300   // 485: 半双工短命令, 一帧几十字节, 300ms 足够
+=======
+// [2026-11-02 二次修复] 485 从 300ms 收紧到 80ms:
+//   485 上一帧最长 15 字节(≈1.3ms @115200), 模块之间的最小间隔实测 11ms,
+//   80ms 已是帧长的 60 倍, 绝不会误杀正常帧; 而残帧停留时间越短, 吞掉后续命令的窗口越小。
+#define PARSE_TIMEOUT_MS_485     80
+>>>>>>> Stashed changes
 #define PARSE_TIMEOUT_MS_MAX  60000   // 非法配置的上限保护
 
 // 命令来源通道 (0 = TCP 客户端, 1 = RS-485 总线)
@@ -56,18 +63,32 @@ typedef enum {
 } protocol_parse_state_t;
 
 typedef struct {
+<<<<<<< Updated upstream
     protocol_parse_state_t state;
     uint32_t need;
     uint32_t len;
     uint64_t parse_start_ms;   // 进入非IDLE状态时的单调时钟(ms), 0=IDLE
     uint32_t timeout_ms;       // 本通道的残帧超时(0=用默认值)
+=======
+    protocol_parse_state_t state;   // 仅用于日志显示(缓冲非空=正在收帧)
+    uint32_t need;                  // 仅用于日志: 还差多少字节
+    uint32_t len;                   // 缓冲里已收、尚未处理的字节数
+    uint64_t parse_start_ms;        // 最近一次收到字节的单调时钟(ms), 0=IDLE
+    uint32_t timeout_ms;            // 本通道的残帧超时(0=用默认值)
+>>>>>>> Stashed changes
     uint8_t  buf[MAX_PACKET_SIZE];
-    command_t command;      
+    command_t command;
 } protocol_parser_t;
 
 void protocol_parser_init(protocol_parser_t *parser);
 void protocol_parser_feed(protocol_parser_t *parser, const uint8_t *data, int len);
+<<<<<<< Updated upstream
 int  protocol_parser_check_timeout(protocol_parser_t *parser);  // 返回1=超时需重置
+=======
+// 返回1=已超时并完成重新同步(只丢到下一个 AB CD 帧头处再继续解析, 不整包清空),
+// 这样跟在残帧后面的好命令还能被救回来。返回0=正常。
+int  protocol_parser_check_timeout(protocol_parser_t *parser);
+>>>>>>> Stashed changes
 void protocol_parser_set_timeout(protocol_parser_t *parser, uint32_t ms); // 设置本通道残帧超时
 void send_error_reply(const command_t *command, uint8_t reply_opcode, uint8_t err_opcode);
 #endif // PROTOCOL_H
