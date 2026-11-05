@@ -68,6 +68,217 @@ static long long task_now_us(void) {
     return (long long)ts.tv_sec * 1000000LL + (long long)ts.tv_nsec / 1000LL;
 }
 
+// ============================================================================
+// ★★★ 新增功能: 3 秒无操作自动关闭开关通道 (IDLE-CLOSE) ★★★
+//     排查时搜关键字: IDLE-CLOSE / idle_close
+//
+// 【需求】上位机连续 3 秒没有下发任何命令 -> 自动把 0x00~0x0F 全部开关卡通道关闭,
+//         避免被测节点在无人操作期间长期带电。
+//
+// 【本功能一共改了 4 个文件, 排查时按下列顺序看】
+//   1) 本段(task.c 顶部)          —— 看门狗线程 + 全部状态, 唯一实现处
+//   2) src/protocol.c  execute_command() 开头
+//      -> idle_close_note_activity()  每条合法命令刷新"最后活动时刻"
+//   3) src/task.c  Task_Test_En() / Task_ADC_Auto_Scan()
+//      -> idle_close_hold_enter/leave()  长任务期间挂起空闲判定
+//         (扫描一次要好几秒、加压测试更久, 这期间不会有新命令, 不挂起就会
+//          在扫描/加压中途把通道关掉 -> 数据全废)
+//   4) src/main.c  idle_close_start()   启动看门狗线程(在 init_all_gpios() 之后)
+//
+// 【判定逻辑】线程每 200ms 检查一次:
+//      空闲时长 = now - 最后活动时刻
+//      满足 "空闲 >= 3000ms" 且 "无长任务在跑" 且 "当前不是已关闭状态" -> 关通道
+//      关完置"已关闭"; 任何新命令到来立刻清掉该标志并重新计时。
+//      ★ 开机默认按"已关闭"算, 所以上电不会有那 16 帧广播。
+//
+// 【与 0x23/0x1D 的并发保护】关闭动作要连发 16 帧(最坏约 0.6s)。若关闭进行中
+//   恰好来了 0x23/0x1D, 可能出现"通道刚被选中又被随后的帧关掉"。
+//   因此这两个任务开头会调 idle_close_wait_if_closing() 等关闭做完再继续,
+//   保证最终状态一定是"选中", 不会出现扫到空通道。
+// ============================================================================
+#define IDLE_CLOSE_TIMEOUT_MS   3000    // ★ 空闲阈值: 3 秒没操作就关通道
+#define IDLE_CLOSE_POLL_MS       200    // 看门狗检查周期(ms)
+#define IDLE_CLOSE_WAIT_MAX_MS  2000    // 0x23/0x1D 等待"关闭动作"结束的上限(ms)
+#define IDLE_CLOSE_RETRY_MAX        3    // 关闭失败后的最多尝试次数(含首次)
+
+static pthread_mutex_t g_idle_lock = PTHREAD_MUTEX_INITIALIZER;
+static long long g_idle_last_act_ms = 0;   // 最后一次"有操作"的时刻(ms, 单调时钟)
+static int  g_idle_closed   = 1;           // 1 = 当前处于"全部已关闭"状态(开机默认按已关闭算)
+static int  g_idle_hold     = 0;           // >0 = 有长任务(扫描/加压)在跑, 暂停空闲判定
+static int  g_idle_closing  = 0;           // 1 = 正在执行关闭动作(0x23/0x1D 会等它结束)
+static int  g_idle_started  = 0;           // 1 = 看门狗线程已启动
+static int  g_idle_retry    = 0;           // 关闭失败的重试计数(到 IDLE_CLOSE_RETRY_MAX 放弃)
+
+static long long idle_close_now_ms(void) {
+    return task_now_us() / 1000;
+}
+
+// ---------- 对外接口 1: 记一次"有操作" ----------
+// 由 protocol.c 的 execute_command() 对每一条合法命令调用(含 0x23/0x1D/0x07 等)。
+void idle_close_note_activity(void) {
+    pthread_mutex_lock(&g_idle_lock);
+    g_idle_last_act_ms = idle_close_now_ms();
+    g_idle_closed      = 0;      // 一有操作就退出"已关闭", 重新开始 3 秒计时
+    g_idle_retry       = 0;      // 有新操作就重置失败计数, 下次空闲仍会尝试关闭
+    pthread_mutex_unlock(&g_idle_lock);
+}
+
+// ---------- 对外接口 2/3: 长任务挂起/恢复空闲判定 ----------
+// 扫描(0x1D)与加压测试(0x11)期间不会有新命令, 必须挂起, 否则会被误判空闲。
+// 用计数器是为了支持嵌套/重叠(比如 0x11 循环里又触发扫描)。
+void idle_close_hold_enter(const char *who) {
+    pthread_mutex_lock(&g_idle_lock);
+    g_idle_hold++;
+    g_idle_last_act_ms = idle_close_now_ms();   // 长任务开始也算一次活动
+    int n = g_idle_hold;
+    pthread_mutex_unlock(&g_idle_lock);
+
+    if (n == 1) {
+        printf("[IDLE-CLOSE] ⏸ 暂停空闲判定: %s 开始(长任务, 期间不会自动关通道)\n",
+               (who != NULL) ? who : "?");
+    }
+}
+
+void idle_close_hold_leave(const char *who) {
+    pthread_mutex_lock(&g_idle_lock);
+    if (g_idle_hold > 0) {
+        g_idle_hold--;
+    }
+    int n = g_idle_hold;
+    g_idle_last_act_ms = idle_close_now_ms();   // 任务结束重新开始计 3 秒
+    pthread_mutex_unlock(&g_idle_lock);
+
+    if (n == 0) {
+        printf("[IDLE-CLOSE] ▶ 恢复空闲判定: %s 结束, 之后 %dms 无操作即关闭通道\n",
+               (who != NULL) ? who : "?", IDLE_CLOSE_TIMEOUT_MS);
+    }
+}
+
+// ---------- 对外接口 4: 若正在自动关闭, 等它做完 ----------
+// 只在 0x23(设通道) 与 0x1D(扫描) 开头调用。等待上限 2s, 超时也继续(仅告警)。
+void idle_close_wait_if_closing(const char *who) {
+    int waited = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_idle_lock);
+        int closing = g_idle_closing;
+        pthread_mutex_unlock(&g_idle_lock);
+
+        if (!closing) {
+            if (waited > 0) {
+                printf("[IDLE-CLOSE] ⏳ %s 已等到自动关闭结束(等了 %dms), 继续执行\n",
+                       (who != NULL) ? who : "?", waited);
+            }
+            return;
+        }
+        if (waited >= IDLE_CLOSE_WAIT_MAX_MS) {
+            printf("[IDLE-CLOSE] ⚠️ %s 等待自动关闭结束超时(%dms), 继续执行;"
+                   " 若本次扫描无数据, 请核对是否与自动关闭撞车\n",
+                   (who != NULL) ? who : "?", waited);
+            return;
+        }
+        usleep(5 * 1000);
+        waited += 5;
+    }
+}
+
+// ---------- 看门狗线程 ----------
+static void *idle_close_worker(void *arg) {
+    (void)arg;
+    printf("[IDLE-CLOSE] ✅ 空闲看门狗已启动: %dms 无操作即关闭 0x00~0x0F 全部开关通道"
+           "(每 %dms 检查一次)\n", IDLE_CLOSE_TIMEOUT_MS, IDLE_CLOSE_POLL_MS);
+
+    for (;;) {
+        usleep(IDLE_CLOSE_POLL_MS * 1000);
+
+        long long now = idle_close_now_ms();
+
+        pthread_mutex_lock(&g_idle_lock);
+        if (g_idle_hold > 0) {
+            // 长任务期间: 基准一直推到"当前", 任务结束后才从 0 开始计 3 秒
+            g_idle_last_act_ms = now;
+        }
+        int        hold    = g_idle_hold;
+        long long  last    = g_idle_last_act_ms;
+        int        already = g_idle_closed;
+        pthread_mutex_unlock(&g_idle_lock);
+
+        if (hold > 0 || already) {
+            continue;                       // 长任务中 / 已经关过了 -> 什么都不做
+        }
+
+        long long idle = now - last;
+        if (idle < IDLE_CLOSE_TIMEOUT_MS) {
+            continue;                       // 还没到 3 秒
+        }
+
+        // 关闭前二次确认: 把"刚判定空闲、命令就到了"的窗口压到最小
+        pthread_mutex_lock(&g_idle_lock);
+        if (g_idle_hold > 0 || g_idle_closed ||
+            idle_close_now_ms() - g_idle_last_act_ms < IDLE_CLOSE_TIMEOUT_MS) {
+            pthread_mutex_unlock(&g_idle_lock);
+            continue;
+        }
+        g_idle_closed  = 1;    // 先置位: 关闭本身耗时, 防止下一轮重复触发
+        g_idle_closing = 1;
+        pthread_mutex_unlock(&g_idle_lock);
+
+        // ===== 真正关闭: 两条路径都走, 与 0x2F(Disable_All_Switch) 的收尾一致 =====
+        printf("[IDLE-CLOSE] ⏱ 已 %lldms 无任何操作(阈值 %dms), 开始关闭全部开关通道...\n",
+               idle, IDLE_CLOSE_TIMEOUT_MS);
+        int r1 = disable_all_switch_via_cpld();   // CPLD 广播: 0x00~0x0F 共 16 张卡, CH=0
+        int r2 = disable_all_switch();            // GPIO: PA11/PB0 拉低 + 补一帧 CPLD 0x00 0x00
+        int ok = (r1 == 0 || r2 == 0);
+
+        // 失败时 200ms 后再试, 但最多试 IDLE_CLOSE_RETRY_MAX 次, 避免 485 断了之后无休止广播
+        pthread_mutex_lock(&g_idle_lock);
+        g_idle_closing = 0;
+        if (ok) {
+            g_idle_retry  = 0;
+            g_idle_closed = 1;
+        } else if (++g_idle_retry < IDLE_CLOSE_RETRY_MAX) {
+            g_idle_closed = 0;                    // 保持"未关闭", 下一轮再试
+        } else {
+            g_idle_closed = 1;                    // 放弃重试(日志会写清楚)
+        }
+        int retry = g_idle_retry;
+        pthread_mutex_unlock(&g_idle_lock);
+
+        if (ok) {
+            printf("[IDLE-CLOSE] ✅ 自动关闭完成(cpld_ret=%d, gpio_ret=%d); "
+                   "下次下发命令会重新选中通道\n", r1, r2);
+        } else {
+            printf("[IDLE-CLOSE] ❌ 自动关闭失败(cpld_ret=%d, gpio_ret=%d), 请检查 485/CPLD 与 GPIO;"
+                   " %s\n", r1, r2,
+                   (retry < IDLE_CLOSE_RETRY_MAX) ? "稍后自动重试" : "已达重试上限, 不再尝试");
+        }
+    }
+    return NULL;
+}
+
+// ---------- 对外接口 5: 启动看门狗(由 main.c 调用, 可重复调用) ----------
+int idle_close_start(void) {
+    if (g_idle_started) {
+        return 0;
+    }
+    g_idle_started = 1;
+
+    pthread_mutex_lock(&g_idle_lock);
+    g_idle_last_act_ms = idle_close_now_ms();
+    g_idle_closed      = 1;     // 开机没人操作过, 按"已关闭"算, 不白发 16 帧广播
+    g_idle_hold        = 0;
+    g_idle_closing     = 0;
+    pthread_mutex_unlock(&g_idle_lock);
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, idle_close_worker, NULL) != 0) {
+        printf("[IDLE-CLOSE] ❌ 看门狗线程创建失败, 本功能未启用\n");
+        g_idle_started = 0;
+        return -1;
+    }
+    pthread_detach(tid);
+    return 0;
+}
+
 // 注：回包缓冲已改为各任务函数内的局部变量（线程池并发执行时互不干扰），不再使用全局缓冲
 
 // 整包 checksum：用 64 位累加器对（包头+长度+操作码+数据）求和取低16位，不含校验码自身
@@ -404,6 +615,13 @@ void Task_Test_En(void *arg) {
     uint32_t status = 0xFFFFFFFF;
         task_reply_u32(task_arg, 0x12, status, "TestEn");
    atomic_store(&HV_stop_flag, 0);
+
+    // [IDLE-CLOSE] 加压测试期间不会有新命令, 挂起"3 秒无操作自动关通道"的判定,
+    //   否则测试开始 3 秒后通道会被自动关掉(读数会突变, 且容易被误判为硬件故障)。
+    //   ★ 若希望"加压测试期间也强制自动关闭", 把下面这一行和函数末尾的
+    //     idle_close_hold_leave 一起注释掉即可(两处必须成对, 否则永远不会自动关)。
+    idle_close_hold_enter("0x11 加压测试");
+
 int val = 0;
 while (1) {
     // 每50ms检测一次
@@ -461,6 +679,11 @@ while (1) {
     disable_all_switch();
     Finish_HV();
     mculdac0();
+
+    // [IDLE-CLOSE] 与上面的 idle_close_hold_enter 成对: 加压测试结束, 恢复空闲判定。
+    //   从这一刻起 3 秒内没有新命令, 就会自动关闭全部开关通道。
+    idle_close_hold_leave("0x11 加压测试");
+
     printf("[TestEn] ✅ 任务完成: 已关闭高压与全部开关, 采样循环已退出\n");
     free(task_arg);
 }
@@ -887,6 +1110,10 @@ void Task_Set_Scan_Channels(void *arg) {
     command_t *task_arg = (command_t *)arg;
     uint8_t *data = task_arg->data;
 
+    // [IDLE-CLOSE] 若此刻"3 秒无操作自动关通道"正在连发 16 帧, 先等它发完再设通道。
+    //   不等的话会出现"通道刚选中, 又被后面的关闭帧关掉" -> 本次扫描全是空数据。
+    idle_close_wait_if_closing("0x23 设通道");
+
     // 打印：任务开始
     printf("[SetScanChannels] ▶ 任务开始: 设置扫描通道队列\n");
 
@@ -1257,6 +1484,15 @@ void Task_ADC_Auto_Scan(void *arg) {
     command_t *task_arg = (command_t *)arg;
     if (task_arg->data) { free(task_arg->data); task_arg->data = NULL; }
     uint8_t echo[2];
+
+    // [IDLE-CLOSE] 同 0x23: 若"3 秒无操作自动关通道"正在关, 等它关完再开始扫描。
+    //   扫描开始后再被关掉的话, 这一整轮的 0x1E 数据都是错的(采的是断开后的悬空值)。
+    idle_close_wait_if_closing("0x1D 扫描");
+
+    // [IDLE-CLOSE] 扫描一次要几秒到几十秒, 期间不会有新命令, 必须挂起空闲判定。
+    //   与函数末尾的 idle_close_hold_leave 成对(中间任何 return 之前也要配对)。
+    idle_close_hold_enter("0x1D 扫描");
+
     // 打印：任务开始
     printf("[AutoScan] ▶ 任务开始: 自动 ADC 扫描, 每通道采样=%d 次\n", Times_Read_ADC121);
  atomic_store(&HV_stop_flag, 0);
@@ -1481,6 +1717,11 @@ void Task_ADC_Auto_Scan(void *arg) {
     }
 
     atomic_store(&adc_stop_flag, 1);
+
+    // [IDLE-CLOSE] 与函数开头的 idle_close_hold_enter 成对: 扫描结束, 恢复空闲判定。
+    //   放在回包之前, 是为了不在 0x1E 之后引入任何耗时动作(那会拖慢 0x1D 的释放)。
+    idle_close_hold_leave("0x1D 扫描");
+
     printf("[AutoScan] ✅ 任务完成: 共采集 %u 次\n", total_reads);
 
     // [2026-10-23] 扫描结束(含被 0x21 中断)一律关闭全部开关通道, 使输出端静默,

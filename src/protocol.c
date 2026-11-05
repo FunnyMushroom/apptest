@@ -362,6 +362,10 @@ static int execute_command(const command_t *command) {
         return -1;
     }
 
+    // [IDLE-CLOSE] 每一条合法命令都算一次"操作": 刷新最后活动时刻, 并解除"已关闭"状态,
+    //   使"3 秒无操作自动关通道"重新开始计时。实现见 task.c 顶部 IDLE-CLOSE 段。
+    idle_close_note_activity();
+
     switch (command->opcode) {
         // ---------- 1. 板卡检测 ----------
         case 0x01:

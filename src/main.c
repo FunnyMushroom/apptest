@@ -295,6 +295,14 @@ if (mq == (mqd_t)-1) {
 
     printf("[MAIN]   步骤: 初始化全部 GPIO\n");
     init_all_gpios();
+
+    // [IDLE-CLOSE] 启动"3 秒无操作自动关闭开关通道"的看门狗线程。
+    //   必须在 init_all_gpios() 之后(关通道要用 PA11/PB0), 且要在能收命令之前。
+    //   实现见 src/task.c 顶部 IDLE-CLOSE 段; 阈值 IDLE_CLOSE_TIMEOUT_MS 默认 3000ms。
+    printf("[MAIN]   步骤: 启动空闲自动关通道看门狗 (3s)\n");
+    if (idle_close_start() != 0) {
+        printf("[MAIN] ⚠️ 空闲自动关通道启动失败, 该功能不可用(不影响其它功能)\n");
+    }
    
     // 各子系统已就绪, 确认本次升级成功(OTA 使用)
     ota_mark_ok();
@@ -312,7 +320,7 @@ if (mq == (mqd_t)-1) {
         }
     }
     printf("[MAIN] ✅ 全部子系统初始化完成, 进入主循环 (日志: /tmp/program_arm.log, 就绪标记: /tmp/program_arm.ready)\n");
-    printf("[MAIN] : 当前版本:app923 编译时间: %s\n", BUILD_STAMP);
+    printf("[MAIN] : 当前版本:app1102 编译时间: %s\n", BUILD_STAMP);
 
     // 主循环(等待退出信号)
     while (running)
