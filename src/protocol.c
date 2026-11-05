@@ -572,12 +572,15 @@ static int execute_command(const command_t *command) {
                 return -1;
             break;
         case 0x23:
-            // [2026-11-02] 同步执行: 必须保证"入队 + 回 0x24"都发生在 0x1D 被解析之前,
-            //   否则扫描可能在队列还空着时启动(以及 PD14/PD15 的拉低被推迟到扫描开始之后)。
-            // [2026-11-03] 数据改为 5 字节: collect(2) + switch(2) + 频率系数(1, ×10kHz);
-            //   兼容旧格式 4 字节(不含频率 = 不修改频率), 两者都放行, 由任务内部区分。
-            if (command->data_len != 5 && command->data_len != 4) {
-                printf("[EXEC] ❌ 0x23 (scan) 参数长度不合法: 实际 %u 字节, 期望 4 或 5 字节\n",
+            // [2026-11-02] 同步执行: 必须保证"入队 + 立即下发 FPGA 帧 + 回 0x24"都发生在
+            //   0x1D 被解析之前, 否则扫描可能在队列还空着时启动(以及 PD14/PD15 的拉低
+            //   被推迟到扫描开始之后)。
+            // [2026-11-04] 与 app923 工程对齐: 只收 5 字节新格式
+            //   collect(2) + switch(2) + 频率系数(1, ×10kHz);
+            //   旧 4 字节格式一律回 0xF3 拒绝(上位机工具已全部升级为 5 字节)。
+            if (command->data_len != 5) {
+                printf("[EXEC] ❌ 0x23 (scan) 参数长度不合法: 实际 %u 字节, 期望 5 字节"
+                       "(collect 2 + switch 2 + freq 1)\n",
                        (unsigned)command->data_len);
                 send_error_reply(command, 0xf3, command->opcode);
                 return -1;

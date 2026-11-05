@@ -221,7 +221,7 @@ int disable_all_switch(void) {
     int pa11 = 11;   // PA11
     int pb0 = 32;    // PB0
 
-    cpld_send_hex_command_block(0x00,00);
+    cpld_send_hex_command_block(0x00, 0x00, CPLD_DEFAULT_FREQ);
     printf("[disable_all_switch] ▶ 开始关闭全部开关\n");
 
     gpio_t *g_pa11 = gpio_init(pa11, GPIO_DIR_OUT);
@@ -257,7 +257,7 @@ int disable_all_switch_via_cpld(void) {
 
     for (uint8_t a = 0x00; a <= 0x0F; a++) {
         uint8_t b = 0x00;
-        if (cpld_send_hex_command_block(a, b) != 0) {
+        if (cpld_send_hex_command_block(a, b, CPLD_DEFAULT_FREQ) != 0) {
             printf("[disable_all_switch_cpld] ❌ 发送失败: 帧 0x%02X 0x%02X\n", a, b);
             // 如需失败即停, 在这里 break; 否则继续发送剩余帧
             // break;

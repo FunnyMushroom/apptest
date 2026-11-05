@@ -45,9 +45,11 @@ uint8_t HV = 0;   // ADC121 读取次数
 
 // ==================== 扫描通道队列 (opcode 0x23 设置) ====================
 // 扫描通道结构体：collect 为采集卡通道，switch 为开关卡通道
+// [2026-11-04] 与 app923 对齐: 增加 freq 字段(0x23 第 5 字节), 扫描时随通道帧透传给 CPLD
 typedef struct {
     uint16_t collect;   // 采集卡通道号
     uint16_t sw;        // 开关卡通道号 (switch 是 C++ 关键字，用 sw 代替)
+    uint8_t  freq;      // 开关卡激励频率系数(1~200, ×10kHz), 0x1D 扫描时随 AA 卡号 通道 频率 ED 下发
 } scan_channel_t;
 
 // [2026-10-16] 1024 -> 4096: 现场开关卡要插满 16 张(卡号 0~15),
@@ -63,7 +65,7 @@ static pthread_mutex_t g_scan_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 //   -> 一个 0x1E 都不发 -> 上位机判该点失败。
 //   0x1D 的语义就是"扫我刚才入队的那一个通道", 队列为空时退回最后一个入队成功的通道,
 //   比"什么都不发"好得多(数据可能是上一次的通道, 但至少链路不会整点失败, 且日志会写清楚)。
-static scan_channel_t g_last_scan_ch = { 0, 0 };
+static scan_channel_t g_last_scan_ch = { 0, 0, 0 };
 static int            g_last_scan_valid = 0;
 
 // [2026-11-02 二次修复] 队列"新鲜度": 队列里的通道是给紧接着的那条 0x1D 用的。
@@ -890,40 +892,50 @@ void split_num(uint16_t num, uint8_t *high, uint8_t *low)
     if (low)  *low  = (uint8_t)(num % 128 + 1);
 }
 
-// [2026-11-03] 频率随 0x23 下发的辅助: 把开关卡号/通道换算成 FPGA 的 5 字节频率帧
-//   地址 = switch/128, 通道 = switch%128 + 1(与 split_num 的 1 基约定一致)。
-//   [2026-11-04] FPGA 收到频率帧会回显 2 字节(地址+通道), cpld_send_freq_frame
-//   发完后最多等 5ms 回显: 0 = 成功; -2 = 已发出但未确认; -1 = 未发出。
-//   频率帧是"尽力而为": 任何失败都只打印, 不影响通道选择与 0x24 回包。
-//   [2026-11-04] freq 扩到 1~256: 0 或 >256 直接返回(0 = 调用方表示"不下发",
-//   256 由 cpld_send_freq_frame 编码成 0x00)。越界在调用处已打印警告。
-static void set_scan_freq_frame(uint16_t switch_num, uint16_t freq) {
-    if (freq < CPLD_FREQ_MIN || freq > CPLD_FREQ_MAX) {
-        return;
-    }
-    uint8_t faddr = 0, fch = 0;
-    split_num(switch_num, &faddr, &fch);
-    int ret = cpld_send_freq_frame(faddr, fch, freq);
-    if (ret == -2) {
-        printf("[SetScanChannels] ⚠️ 频率帧已发出但 FPGA 未回显(开关卡=%u, 通道=%u, 频率=%u): "
-               "频率可能未生效, 通道选择不受影响\n", faddr, fch, (unsigned)freq);
-    } else if (ret != 0) {
-        printf("[SetScanChannels] ⚠️ 频率帧未发出(开关卡=%u, 通道=%u, 频率=%u), 通道选择不受影响\n",
-               faddr, fch, (unsigned)freq);
+// [2026-11-04] 已与 app923 工程对齐: 0x23 入队后立即下发 FPGA 帧的辅助。
+//   把开关卡号/通道换算成 FPGA 的 5 字节帧(地址 = switch/128, 通道 = switch%128 + 1,
+//   与 split_num 的 1 基约定一致), 当场发出并等 2 字节回显:
+//   cpld_send_hex_command_wait_reply(每次等 10ms, 最多重发 3 次 = 合计 4 次)。
+//   不必等 0x1D 启动, 方便示波器直接验证频率; 0x1D 扫描时仍会按队列重发(幂等)。
+//   安全性: 进入本任务的前置检查已保证 adc_stop_flag==1(无扫描在进行),
+//   不会与 Task_ADC_Auto_Scan 的 cpld 发送并发撞车; 485_cpld.c 的 g_mutex
+//   进一步保证即使撞上, 帧在线上也不会交错。
+//   时序: 回显通常 1~2ms 即到(0x23 总耗时 <3ms, 0x23→0x1D 实测间隔 ~13ms, 安全);
+//   仅当 FPGA 无应答时最坏阻塞 ~40ms —— 0x1D 会晚 ~27ms 才被解析,
+//   只影响启动延迟, 不丢帧(串口接收缓冲足够容纳)。
+//   失败不影响队列: 通道仍保留在队列里, 0x1D 扫描时会重试。
+static void set_scan_send_fpga_now(uint16_t switch_num, uint8_t freq) {
+    uint8_t f_card = 0, f_ch = 0, f_echo[2] = { 0, 0 };
+    split_num(switch_num, &f_card, &f_ch);
+    int ret = cpld_send_hex_command_wait_reply(f_card, f_ch, freq, f_echo);
+    if (ret == 0) {
+        printf("[SetScanChannels] ✅ FPGA 帧已立即下发: AA %02X %02X %02X ED, 回显 %02X %02X"
+               " (频率系数=%u, =%u kHz)\n",
+               f_card, f_ch, freq, f_echo[0], f_echo[1], freq, freq * 10u);
+    } else {
+        printf("[SetScanChannels] ❌ FPGA 帧立即下发失败(ret=%d): AA %02X %02X %02X ED, "
+               "通道仍保留在队列中(0x1D 会重试)\n",
+               ret, f_card, f_ch, freq);
     }
 }
 // ==================== 操作码 0x23: 设置扫描通道队列 ====================
-// 数据: 5字节, 前2字节为 collect (大端), 后2字节为 switch (大端), 第5字节为频率系数
-//   第5字节 = 频率系数(1~256, 单位 10kHz), 下位机按开关卡号/通道换算成
-//   FPGA 5字节帧 AA 地址 通道 频率 ED(地址=switch/128, 通道=switch%128+1, 同 split_num),
-//   发出后等待 FPGA 回显(地址+通道), 最多 5ms, 不影响 0x1D 时序。
-//   [2026-11-04] 频率范围 1~128 -> 1~256: 帧里只有 1 字节, 256 编码为 0x00。
-//   因此"不下发频率"的判断改为看**帧长**(4 字节 = 旧格式 = 不下发), 不再用 freq==0 判断。
-//   兼容旧格式: 数据为 4 字节(无频率系数)时不修改频率, 其余处理相同。
+// 数据: 5字节, 采集卡2字节(大端) + 开关卡2字节(大端) + 频率1字节
 // 一次只添加一个通道到队列
-// 回包 0x24: 数据位宽与请求保持一致(新格式 5 字节, 旧格式 4 字节)
-//   成功: 原样回显收到的数据 (collect+switch+freq), 便于上位机核对
-//   失败: 0xFFFFFFFE = 队列已满, 0xFFFFFFFF = adc_stop_flag 未置 1(被拒), 均为 4 字节
+// [2026-11-04] 已与 app923 工程的实现对齐:
+//   - 只收 5 字节新格式(4 字节旧格式由 protocol.c 回 0xF3 拒绝);
+//   - 频率合法域 1~200(CPLD_FREQ_MIN/MAX): 0xED(237) 是帧尾, 0 或 >200 会被
+//     CPLD 判为坏帧整帧丢弃且不回包 -> 板子重发耗尽 -> 该通道被跳过, 极难排查,
+//     所以非法频率直接拒绝入队, 回 0x24 + 0xFFFFFFFD;
+//   - 入队成功后立即经开关卡控制串口下发 FPGA 帧 AA 卡号 通道 频率 ED 并等
+//     2 字节回显(见 set_scan_send_fpga_now), 不必等 0x1D 启动。
+// 保留了 app1104 原有的现场修复(2026-11-02):
+//   - PD14/PD15 脉冲提前拉低(避免扫描开始后才出现下降沿);
+//   - 陈旧队列清理(上一轮 0x1D 丢失时不追加, 防止下次扫出 2 倍帧数);
+//   - 重发幂等去重(同一条 0x23 被重发时不重复入队)。
+// 回包 0x24: 数据位宽与请求保持一致, 同为 5 字节
+//   成功: 原样回显收到的 5 字节 (collect+switch+freq), 便于上位机核对
+//   失败: 0xFFFFFFFE = 队列已满, 0xFFFFFFFF = adc_stop_flag 未置 1(被拒),
+//         0xFFFFFFFD = 频率非法, 均为 4 字节
 // [2026-11-02] 提前声明: 本函数里要先把上一次扫描留下的 PD14/PD15 脉冲拉低
 //   (定义在本文件后部 PD14/PD15 脉冲那一节)
 static int pd1415_pulse_cancel(void);
@@ -964,31 +976,37 @@ void Task_Set_Scan_Channels(void *arg) {
         printf("[SetScanChannels]   PD14/PD15 已在上一次脉冲自然结束前被拉低(上位机回访偏快), 详见上行宽度\n");
     }
 
-    // 解析数据: 前2字节 collect, 后2字节 switch (大端); 第5字节为频率系数(新格式)
+    // 解析 5 字节数据(大端): collect(2) + switch(2) + freq(1)
+    // protocol.c 的 0x23 分支已保证 data_len == 5, 不再有"缺频率"的分支。
     uint16_t collect_ch = be16(data);      // 前2字节
-    uint16_t switch_ch = be16(data + 2);   // 后2字节
-    // [2026-11-03] 第 5 字节 = 频率系数(1~256, ×10kHz); 旧 4 字节格式没有该字节 = 不修改频率
-    // [2026-11-04] 频率扩到 1~256 后, 0x00 不再表示"不下发", 而是"256"。
-    //   "是否下发"只看帧长: data_len >= 5 -> 一定下发; 4 -> 不下发。
-    uint16_t freq = 0;                     // 0 = 不下发频率帧(仅旧4字节格式)
-    if (task_arg->data_len >= 5) {
-        freq = data[4];
-        if (freq == 0) {
-            freq = 256;                    // 0x00 约定为满量程 256 (×10kHz = 2.56MHz)
-        }
-    }
-    // 回包原样回显收到的数据(5 或 4 字节), 先拷到局部缓冲, 后面会 free(task_arg->data)
-    uint8_t  echo_buf[5] = { 0 };
-    uint32_t echo_len = (task_arg->data_len >= 5) ? 5 : 4;
-    memcpy(echo_buf, data, echo_len);
+    uint16_t switch_ch = be16(data + 2);   // 次2字节
+    uint8_t  freq = data[4];               // 第5字节: 频率系数 1~200
 
-    printf("[SetScanChannels]   收到通道: collect=%u, switch=%u, freq=%u%s\n",
-           collect_ch, switch_ch, (unsigned)freq,
-           (echo_len == 5) ? "" : " (旧4字节格式, 不修改频率)");
-    if (echo_len == 5 && freq > CPLD_FREQ_MAX) {
-        printf("[SetScanChannels] ⚠️ 频率系数越界: %u (有效 1~256), 本次不下发频率帧, 通道选择照常\n",
-               (unsigned)freq);
+    // [app923] 频率合法性必须在这里拦: CPLD 的 FR_FREQ 状态只认 0xED(帧尾)
+    //   或 1~200(频率码), 其它值一律 frame_err; 而 frame_err 不会回包。
+    //   一旦放过去, 板子会 cpld_send_hex_command_wait_reply 重发 4 次全超时,
+    //   最后跳过该通道 -> 表现为"这个节点没数据", 极难查。
+    //   0xED(237) 更隐蔽: 会被当成 4 字节老帧的帧尾, 通道切了但频率没改。
+    if (freq < CPLD_FREQ_MIN || freq > CPLD_FREQ_MAX) {
+        printf("[SetScanChannels] ❌ 频率参数非法: freq=0x%02X(%u), 合法范围 %d~%d (即 %d~%d kHz), 拒绝入队\n",
+               freq, freq, CPLD_FREQ_MIN, CPLD_FREQ_MAX,
+               CPLD_FREQ_MIN * 10, CPLD_FREQ_MAX * 10);
+        task_reply_u32(task_arg, 0x24, 0xFFFFFFFDu, "SetScanChannels");  // 0xFFFFFFFD = 频率非法
+        free(task_arg->data);
+        free(task_arg);
+        return;
     }
+
+    // 回包用: collect(2) + switch(2) + freq(1), 与请求逐字节对应
+    uint8_t echo_buf[5];
+    echo_buf[0] = (uint8_t)(collect_ch >> 8);
+    echo_buf[1] = (uint8_t)(collect_ch & 0xFF);
+    echo_buf[2] = (uint8_t)(switch_ch >> 8);
+    echo_buf[3] = (uint8_t)(switch_ch & 0xFF);
+    echo_buf[4] = freq;
+
+    printf("[SetScanChannels]   收到通道: collect=%u, switch=%u, freq=0x%02X(%u = %ukHz)\n",
+           collect_ch, switch_ch, freq, freq, freq * 10);
 
     pthread_mutex_lock(&g_scan_queue_lock);
 
@@ -1025,11 +1043,12 @@ void Task_Set_Scan_Channels(void *arg) {
         printf("[SetScanChannels] 🔁 重发请求: 尾部已是同一通道(collect=%u, switch=%u), "
                "不重复入队\n", collect_ch, switch_ch);
         pthread_mutex_unlock(&g_scan_queue_lock);
-        // [2026-11-03] 重发也补一次频率帧: 频率设置是幂等的, 重发场景下保证频率不丢
-        set_scan_freq_frame(switch_ch, freq);
+        // [2026-11-04] 重发也补一次立即下发: 通道/频率设置是幂等的,
+        //   重发场景下保证 FPGA 状态与最新请求一致(与 app923 行为对齐)
+        set_scan_send_fpga_now(switch_ch, freq);
         free(task_arg->data);
         task_arg->data = NULL;
-        task_reply(task_arg, 0x24, echo_buf, echo_len, "SetScanChannels");
+        task_reply(task_arg, 0x24, echo_buf, 5, "SetScanChannels");
         free(task_arg);
         return;
     }
@@ -1037,10 +1056,12 @@ void Task_Set_Scan_Channels(void *arg) {
     // 添加到队列
     g_scan_queue[g_scan_queue_len].collect = collect_ch;
     g_scan_queue[g_scan_queue_len].sw = switch_ch;
+    g_scan_queue[g_scan_queue_len].freq = freq;
     g_scan_queue_len++;
     // 记住最后一次成功入队的通道: 0x1D 万一在"队列为空"的情况下到达, 用它兜底
     g_last_scan_ch.collect = collect_ch;
     g_last_scan_ch.sw      = switch_ch;
+    g_last_scan_ch.freq    = freq;
     g_last_scan_valid      = 1;
     g_scan_queue_ts        = task_now_us() / 1000;
     // [2026-10-13] 移除 SD 落盘(lxlceshi.txt): 现场不使用 SD 卡
@@ -1051,25 +1072,28 @@ void Task_Set_Scan_Channels(void *arg) {
                            g_scan_queue_len);
         for (int i = 0; i < g_scan_queue_len && off > 0 && off < (int)sizeof(line); i++) {
             off += snprintf(line + off, sizeof(line) - (size_t)off,
-                            "(collect=%u,sw=%u) ",
-                            g_scan_queue[i].collect, g_scan_queue[i].sw);
+                            "(collect=%u,sw=%u,f=0x%02X) ",
+                            g_scan_queue[i].collect, g_scan_queue[i].sw,
+                            g_scan_queue[i].freq);
         }
         printf("%s\n", line);
     }
 
     pthread_mutex_unlock(&g_scan_queue_lock);
 
-    // [2026-11-04] 频率随通道选择一起下发(在锁外、回包前): 发 5 字节帧并等 FPGA 回显,
-    //   回显通常 1~2ms, 最长 5ms; 成功/未确认都只打日志, 不阻塞 0x24 回包
-    set_scan_freq_frame(switch_ch, freq);
+    // [2026-11-04] 立即下发 FPGA 帧(不等 0x1D, 与 app923 对齐): 入队成功后当场把
+    //   AA 卡号 通道 频率 ED 发到开关卡控制串口并等 2 字节回显,
+    //   方便示波器直接验证频率, 不必再点一次 ADC 自动扫描。
+    set_scan_send_fpga_now(switch_ch, freq);
 
     free(task_arg->data);
     task_arg->data = NULL;
     printf("[SetScanChannels] ✅ 任务完成: 已入队 %d 个通道\n", g_scan_queue_len);
-    // 回包 0x24: 与请求同宽, 原样回显收到的数据 (collect+switch+freq)
-    printf("[SetScanChannels]   回包 0x24 回显数据: %u 字节 (collect=%u, switch=%u, freq=%u)\n",
-           (unsigned)echo_len, collect_ch, switch_ch, (unsigned)freq);
-    task_reply(task_arg, 0x24, echo_buf, echo_len, "SetScanChannels");
+    // 回包 0x24: 成功回 5 字节 collect(2)+switch(2)+freq(1), 逐字节回显便于上位机核对;
+    // 失败(队列满/未先停止/频率非法)回 4 字节错误码, 上位机用长度区分 4=错误 / 5=成功。
+    printf("[SetScanChannels]   回包 0x24 回显: collect=%u, switch=%u, freq=0x%02X\n",
+           collect_ch, switch_ch, freq);
+    task_reply(task_arg, 0x24, echo_buf, 5, "SetScanChannels");
     free(task_arg);
 }
 
@@ -1162,18 +1186,26 @@ int task_rescue_broken_set_channels(command_t *cmd, const uint8_t *tail, int tai
         return 1;
     }
 
+    // [2026-11-04] 与 app923 对齐后 0x23 负载为 5 字节, 坏帧尾巴可能是
+    //   "开关卡2字节+频率1字节"共 3 字节: 尾巴带频率时透传(校验 1~200),
+    //   否则用默认频率 100(=1MHz)。
+    uint8_t rescue_freq = (tail_len >= 3 && tail[2] >= CPLD_FREQ_MIN && tail[2] <= CPLD_FREQ_MAX)
+                          ? tail[2] : (uint8_t)CPLD_DEFAULT_FREQ;
+
     g_scan_queue[g_scan_queue_len].collect = collect_ch;
     g_scan_queue[g_scan_queue_len].sw      = switch_ch;
+    g_scan_queue[g_scan_queue_len].freq    = rescue_freq;
     g_scan_queue_len++;
     g_last_scan_ch.collect = collect_ch;
     g_last_scan_ch.sw      = switch_ch;
+    g_last_scan_ch.freq    = rescue_freq;
     g_last_scan_valid      = 1;
     g_scan_queue_ts        = now_ms;
     pthread_mutex_unlock(&g_scan_queue_lock);
 
     printf("[SetScanChannels] 🆘 补救成功: 上位机 0x23 帧未整帧重建(尾巴 0x%04X), "
-           "已按 (collect=%u, switch=%u) 入队并回包 0x24 —— "
-           "请核对是否与上位机本轮期望的通道一致\n", tail_sw, collect_ch, switch_ch);
+           "已按 (collect=%u, switch=%u, freq=0x%02X) 入队并回包 0x24 —— "
+           "请核对是否与上位机本轮期望的通道一致\n", tail_sw, collect_ch, switch_ch, rescue_freq);
     task_reply_u32(cmd, 0x24, echo_data, "SetScanChannels");
     return 1;
 #endif
@@ -1586,8 +1618,8 @@ void Task_ADC_Auto_Scan(void *arg) {
         if (atomic_load(&adc_stop_flag)) break;
 
         scan_channel_t ch_info = local_queue[q];
-        printf("[AutoScan]   通道 %d/%d: collect=%u, switch=%u\n",
-               q + 1, queue_len, ch_info.collect, ch_info.sw);
+        printf("[AutoScan]   通道 %d/%d: collect=%u, switch=%u, freq=0x%02X\n",
+               q + 1, queue_len, ch_info.collect, ch_info.sw, ch_info.freq);
 
         long long t0 = task_now_us();
         uint8_t card, channel;
@@ -1598,12 +1630,14 @@ void Task_ADC_Auto_Scan(void *arg) {
             // [2026-10-23] 整通道级重试 1 次: 连续扫多通道时, 若 485 总线正被别的
             //   命令占用(内部 4 次重发都撞上), 原来会直接跳过该通道 -> 上位机一直
             //   等这一通道的 0x1E 等不到。这里隔 20ms 再试一次, 仍失败才跳过。
-            int cpld_ret = cpld_send_hex_command_wait_reply(card, channel, echo);  // 0=成功
+            // [2026-11-04] 与 app923 对齐: 切通道帧带频率(AA card ch freq ED),
+            //   freq 来自 0x23 第 5 字节, 每通道可独立设置。
+            int cpld_ret = cpld_send_hex_command_wait_reply(card, channel, ch_info.freq, echo);  // 0=成功
             if (cpld_ret != 0) {
                 printf("[adc自动扫描] ⚠️ 开关卡切通道失败(card=%d, ch=%d, ret=%d), 20ms 后重试一次\n",
                        card, channel, cpld_ret);
                 usleep(20 * 1000);
-                cpld_ret = cpld_send_hex_command_wait_reply(card, channel, echo);
+                cpld_ret = cpld_send_hex_command_wait_reply(card, channel, ch_info.freq, echo);
             }
             if (cpld_ret != 0) {
                 printf("[adc自动扫描] ❌ 开关卡切通道重试仍失败(card=%d, ch=%d, ret=%d), "
@@ -1819,7 +1853,9 @@ void Task_Disable_All_Switch(void *arg){
     // printf("[DisableAllSwitch] ✅ 全部开关已关闭\n");
     for (uint8_t a = 0x00; a <= 0x0F; a++) {
         uint8_t b = 0x00;
-        if (cpld_send_hex_command_block(a, b) != 0) {
+        // [2026-11-04] 与 app923 对齐: 5 字节帧, 关闭帧带默认频率 100(=1MHz);
+        //   通道字节 00 = 关闭该卡全部通道并关闭频率
+        if (cpld_send_hex_command_block(a, b, CPLD_DEFAULT_FREQ) != 0) {
             printf("[CPLD] ❌ 发送失败: 帧 0x%02X 0x%02X\n", a, b);
             // 如需失败即停, 在这里 break; 否则继续发送剩余帧
             // break;
