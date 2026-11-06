@@ -89,6 +89,7 @@ int opcode_release(uint8_t opcode)                                              
 // 注意: w->arg(task_arg) 由任务函数自己释放, 包装器只释放包装结构本身
 typedef struct {
     uint8_t opcode;
+    uint8_t release_opcode;     // 0 = 本次分发没有占用操作码(轮询类命令), 不释放
     void (*function)(void *);
     void *arg;
 } exec_wrap_t;
@@ -97,7 +98,9 @@ static void exec_wrapper(void *p) {
     exec_wrap_t *w = (exec_wrap_t *)p;
     uint8_t op = w->opcode;
     w->function(w->arg);
-    opcode_release(op);
+    if (w->release_opcode) {
+        opcode_release(op);
+    }
     free(w);
 }
 
@@ -132,8 +135,9 @@ static pthread_mutex_t g_dup_lock = PTHREAD_MUTEX_INITIALIZER;
 static dup_cache_t     g_dup_cache[OPCODE_MAX];
 
 // 流式数据命令(0x1D 扫描)的应答是一帧帧的 0x1E, 缓存/回放毫无意义, 必须排除
+// 0x07(读取高压)是轮询命令, 每次都必须是新的采样值, 也不能缓存/回放
 static int dup_cache_opcode_ok(uint8_t opcode) {
-    return (opcode != 0x1D && opcode != 0xFF);
+    return (opcode != 0x1D && opcode != 0xFF && opcode != 0x07);
 }
 
 // 记录一份已发出的回包(供重发请求回放)。仅 485 通道 + 短回包 + 非错误码。
@@ -259,8 +263,10 @@ void send_error_reply(const command_t *command, uint8_t reply_opcode, uint8_t er
 
 
 
+// dedup = 1: 常规命令, 同一操作码单飞(重发时回放上次应答 / 回 0xF1)
+// dedup = 0: 轮询类命令(0x07), 每条请求都必须真正执行一次, 不允许被"去重"或"回放"
 static int dispatch_task(threadpool_t *pool, void (*task_function)(void *),
-                         const command_t *command) {
+                         const command_t *command, int dedup) {
     if (pool == NULL || command == NULL) {
         printf("[EXEC] ❌ 分发任务失败: 线程池或命令为 NULL\n");
         return -1;
@@ -297,7 +303,11 @@ static int dispatch_task(threadpool_t *pool, void (*task_function)(void *),
     }
 
     // 单飞去重: 同一操作码正在执行时, 不再新开线程执行
-    if (opcode_try_acquire(task_arg->opcode) == 0) {
+    // 轮询命令(dedup=0)整段跳过: 上位机按固定周期反复发 0x07, 每一条都要重新采样。
+    //   若走单飞, 第二条会被判"重复指令":
+    //     命中缓存 -> 回放上一次的电压值(读数永远不变, 看起来像"轮询读不到") ;
+    //     未命中缓存 -> 回 0xF1, 上位机按失败处理。
+    if (dedup && opcode_try_acquire(task_arg->opcode) == 0) {
         // 优先尝试回放上次的应答: 上位机"超时后重发"是最常见的重复来源,
         // 直接回 0xF1 会让它等的那条应答永远不到(实锤导致标定步骤必然失败)。
         if (dup_cache_replay(task_arg, opcode_busy_since(task_arg->opcode))) {
@@ -317,18 +327,19 @@ static int dispatch_task(threadpool_t *pool, void (*task_function)(void *),
     if (wrap == NULL) {
         printf("[EXEC] ❌ 分发任务失败: 分配 exec_wrap 内存出错 (0x%02X)\n",
                task_arg->opcode);
-        opcode_release(task_arg->opcode);
+        if (dedup) opcode_release(task_arg->opcode);
         free(task_arg->data);
         free(task_arg);
         return -1;
     }
-    wrap->opcode   = task_arg->opcode;
-    wrap->function = task_function;
-    wrap->arg      = task_arg;
+    wrap->opcode         = task_arg->opcode;
+    wrap->release_opcode = (uint8_t)(dedup ? 1 : 0);
+    wrap->function       = task_function;
+    wrap->arg            = task_arg;
 
     if (threadpool_add(pool, exec_wrapper, wrap) != 0) {
         printf("[EXEC] ❌ 分发任务失败: 投标到线程池出错 (0x%02X)\n", task_arg->opcode);
-        opcode_release(task_arg->opcode);
+        if (dedup) opcode_release(task_arg->opcode);
         free(wrap);
         free(task_arg->data);
         free(task_arg);
@@ -351,7 +362,7 @@ static int dispatch_command_if_len_ok(threadpool_t *pool, const command_t *comma
         send_error_reply(command,0xf3,command->opcode);
         return -1;
     }
-    int rc = dispatch_task(pool, task_function, command);
+    int rc = dispatch_task(pool, task_function, command, 1);
     if (rc == -2 || rc == -3) {
         // -2: 该操作码正在执行中, 重复指令已丢弃
         // -3: 该操作码正在执行中, 但重发请求已用上次应答回放
@@ -365,6 +376,37 @@ static int dispatch_command_if_len_ok(threadpool_t *pool, const command_t *comma
     }
     // 打印：命令成功分发到线程池，显示操作码和命令名称
     printf("[EXEC] ✅ 0x%02X (%s) 已分发到线程池\n", command->opcode, command_name);
+    return 0;
+}
+
+// ==================== 轮询类命令分发(0x07 读取高压) ====================
+// [2026-11-05] 0x07 的用法是"上位机按固定周期反复发, 每次要一个新的电压值"。
+//   旧路径走单飞去重, 在轮询周期 < 单次读取耗时 时会出两种坏结果:
+//     1) 命中重发回放缓存 -> 连续几次读到同一个旧值(读数不刷新, 像"轮询不工作");
+//     2) 未命中缓存 -> 回 0xF1, 上位机按该次采集失败处理。
+//   所以这里给轮询命令开一条专用通道:
+//     - 不做单飞、不查/不写回放缓存: 每条 0x07 都真实执行一次 ADS1115 转换;
+//     - 并发由 Task_Read_HV 内部的专用锁串行化(一次只有一路在读, 不会两条命令抢同一次采样);
+//     - 仍然投线程池, 不阻塞接收线程(不影响同链路上的其它命令解析)。
+//   代价: 上位机若把轮询周期压到低于单次读取耗时, 请求会在池里排队, 应答变慢但不会丢、不会串值。
+static int dispatch_command_poll_if_len_ok(threadpool_t *pool, const command_t *command,
+                                           uint32_t expected_len, void (*task_function)(void *),
+                                           const char *command_name) {
+    if (command->data_len != expected_len) {
+        printf("[EXEC] ❌ 0x%02X (%s) 参数长度不合法: 实际 %u 字节, 期望 %u 字节\n",
+               command->opcode, command_name, (unsigned)command->data_len,
+               (unsigned)expected_len);
+        send_error_reply(command, 0xf3, command->opcode);
+        return -1;
+    }
+    int rc = dispatch_task(pool, task_function, command, 0);
+    if (rc != 0) {
+        printf("[EXEC] ❌ 0x%02X (%s) 分发到线程池失败\n",
+               command->opcode, command_name);
+        return -1;
+    }
+    printf("[EXEC] ✅ 0x%02X (%s) 已分发到线程池(轮询通道, 不去重)\n",
+           command->opcode, command_name);
     return 0;
 }
 
@@ -452,6 +494,10 @@ static int execute_command(const command_t *command) {
         return -1;
     }
 
+    // [IDLE-CLOSE] 每一条合法命令都算一次"操作": 刷新最后活动时刻, 并解除"已关闭"状态,
+    //   使"3 秒无操作自动关通道"重新开始计时。实现见 task.c 顶部 IDLE-CLOSE 段。
+    idle_close_note_activity();
+
     switch (command->opcode) {
         // ---------- 1. 板卡检测 ----------
         case 0x01:
@@ -474,8 +520,10 @@ static int execute_command(const command_t *command) {
             break;
 
         // ---------- 3. 读取高压 ----------
+        // [2026-11-05] 改走轮询通道: 上位机反复发 0x07 时每次都真实采样一次,
+        //   不再被"单飞去重/回放缓存"变成同一个旧值, 也不会回 0xF1。
         case 0x07:
-            if (dispatch_command_if_len_ok(g_thread_pool, command, 1,
+            if (dispatch_command_poll_if_len_ok(g_thread_pool, command, 1,
                     Task_Read_HV, "read_hv") != 0)
                 return -1;
             break;

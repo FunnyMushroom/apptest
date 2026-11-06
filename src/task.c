@@ -76,6 +76,26 @@ static int            g_last_scan_valid = 0;
 #define SCAN_QUEUE_STALE_MS   2000
 static long long g_scan_queue_ts = 0;      // 最近一次入队时刻(ms)
 
+// [2026-11-05] 高压是否已处于"已使能"状态(0x11 置 1, 0x13 清 0)。
+//   0x11 不再常驻循环后会立即释放操作码, 上位机若因 0x12 应答丢失而重发 0x11,
+//   会重跑一遍 START_HV_CHECK(其中 0x05=0x00 撤销放电 50ms) -> 高压瞬断。
+//   用这个标志让重复的 0x11 变成幂等: 已使能时只补一次 0x12 应答, 不再动时序。
+static int g_hv_enabled = 0;
+
+// [2026-11-05] 高压时序串行锁: 0x11 的上电时序(START_HV_CHECK + mculdac)与
+//   0x13 的断电收尾(teststop/Finish_HV/disable_all_switch)必须互斥。
+//   旧实现里 0x13 只置标志、由 0x11 的常驻循环退出时做收尾, 天然串行;
+//   现在收尾改在 0x13 自己的 worker 里执行, 若上位机紧接着发 0x11, 两个 worker
+//   会同时操作 0x05/0x06 与 DAC -> 结果可能是"刚使能就被收尾关掉"。
+static pthread_mutex_t g_hv_seq_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// [2026-11-05] 0x07 轮询专用串行锁。
+//   0x07 现在不做"单飞去重"(见 protocol.c dispatch_command_poll_if_len_ok), 上位机
+//   按固定周期反复发时, 线程池里可能同时存在多条 0x07。ADS1115 是"写配置启动转换 ->
+//   等转换 -> 读结果"的三步时序, 两条命令交错会互相打乱通道/结果, 所以在这里用一把
+//   专用锁把"一条命令 = 一次完整转换"串起来: 读到的每个值都对应一次真实采样。
+static pthread_mutex_t g_hv_read_lock = PTHREAD_MUTEX_INITIALIZER;
+
 // 前向声明
 static void setup_card_gpio(uint8_t card);
 
@@ -84,6 +104,233 @@ static long long task_now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000LL + (long long)ts.tv_nsec / 1000LL;
+}
+
+// ============================================================================
+// ★★★ 新增功能: 3 秒无操作自动关闭开关通道 (IDLE-CLOSE) ★★★
+//     排查时搜关键字: IDLE-CLOSE / idle_close
+//
+// 【需求】上位机连续 3 秒没有下发任何命令 -> 自动把 0x00~0x0F 全部开关卡通道关闭,
+//         避免被测节点在无人操作期间长期带电。
+//
+// 【本功能一共改了 4 个文件, 排查时按下列顺序看】
+//   1) 本段(task.c 顶部)                 —— 看门狗线程 + 全部状态, 唯一实现处
+//   2) src/protocol.c  execute_command() 开头
+//      -> idle_close_note_activity()     每条合法命令刷新"最后活动时刻"
+//   3) src/task.c  Task_Set_Scan_Channels(0x23) / Task_ADC_Auto_Scan(0x1D)
+//      -> idle_close_wait_if_closing()   开头等"正在进行的自动关闭"做完, 免得
+//                                        "通道刚选中又被随后的关闭帧关掉"
+//      -> idle_close_hold_enter/leave()  0x1D 扫描一次要几秒到几十秒, 期间不会有
+//         新命令, 必须挂起空闲判定, 否则扫到一半通道被关 -> 本批数据全废
+//   4) src/main.c  init_all_gpios() 之后 -> idle_close_start() 启动看门狗线程
+//
+// 【与 app1102 的差异(两个工程都保留同一套日志关键字, 便于对照)】
+//   - app1102 的 0x11 以前常驻采样循环, 所以要 hold; app1105 的 0x11 只做"使能"
+//     就立即返回, 不需要 hold(上位机用 0x07 轮询时每 200ms 一条命令, 本身就在
+//     不断刷新活动时刻, 不会误关)。
+//   - app1105 的 0x23 是在接收线程里同步执行的(见 protocol.c), 所以这里的等待
+//     上限收到 500ms: 关闭动作本身只有几十毫秒, 无法匹配时才放行, 绝不长堵收包线程。
+//
+// 【判定逻辑】线程每 200ms 检查一次:
+//      空闲时长 = now - 最后活动时刻
+//      满足 "空闲 >= 3000ms" 且 "无长任务在跑" 且 "当前不是已关闭状态" -> 关通道
+//      关完置"已关闭"; 任何新命令到来立刻清掉该标志并重新计时。
+//      ★ 开机默认按"已关闭"算, 所以上电不会有那 16 帧广播。
+//      ★ 关闭过程中若来了新命令, 本次关闭不置"已关闭"(见 worker 里的 ★并发修正),
+//        否则会出现"通道刚被选中、看门狗却以为已关过 -> 之后再也不关"的漏洞。
+// ============================================================================
+#define IDLE_CLOSE_TIMEOUT_MS   3000    // ★ 空闲阈值: 3 秒没操作就关通道
+#define IDLE_CLOSE_POLL_MS       200    // 看门狗检查周期(ms)
+#define IDLE_CLOSE_WAIT_MAX_MS   500    // 0x23/0x1D 等待"关闭动作"结束的上限(ms)
+#define IDLE_CLOSE_RETRY_MAX       3    // 关闭失败后的最多尝试次数(含首次)
+
+static pthread_mutex_t g_idle_lock = PTHREAD_MUTEX_INITIALIZER;
+static long long g_idle_last_act_ms = 0;   // 最后一次"有操作"的时刻(ms, 单调时钟)
+static int  g_idle_closed   = 1;           // 1 = 当前处于"全部已关闭"状态(开机默认按已关闭算)
+static int  g_idle_hold     = 0;           // >0 = 有长任务(0x1D 扫描)在跑, 暂停空闲判定
+static int  g_idle_closing  = 0;           // 1 = 正在执行关闭动作(0x23/0x1D 会等它结束)
+static int  g_idle_started  = 0;           // 1 = 看门狗线程已启动
+static int  g_idle_retry    = 0;           // 关闭失败的重试计数(到 IDLE_CLOSE_RETRY_MAX 放弃)
+
+static long long idle_close_now_ms(void) {
+    return task_now_us() / 1000;
+}
+
+// ---------- 对外接口 1: 记一次"有操作" ----------
+// 由 protocol.c 的 execute_command() 对每一条合法命令调用(含 0x23/0x1D/0x07 等)。
+void idle_close_note_activity(void) {
+    pthread_mutex_lock(&g_idle_lock);
+    g_idle_last_act_ms = idle_close_now_ms();
+    g_idle_closed      = 0;      // 一有操作就退出"已关闭", 重新开始 3 秒计时
+    g_idle_retry       = 0;      // 有新操作就重置失败计数, 下次空闲仍会尝试关闭
+    pthread_mutex_unlock(&g_idle_lock);
+}
+
+// ---------- 对外接口 2/3: 长任务挂起/恢复空闲判定 ----------
+// 0x1D 扫描期间不会有新命令, 必须挂起, 否则会被误判空闲而在扫描中途关通道。
+// 用计数器是为了支持嵌套/重叠。
+void idle_close_hold_enter(const char *who) {
+    pthread_mutex_lock(&g_idle_lock);
+    g_idle_hold++;
+    g_idle_last_act_ms = idle_close_now_ms();   // 长任务开始也算一次活动
+    int n = g_idle_hold;
+    pthread_mutex_unlock(&g_idle_lock);
+
+    if (n == 1) {
+        printf("[IDLE-CLOSE] ⏸ 暂停空闲判定: %s 开始(长任务, 期间不会自动关通道)\n",
+               (who != NULL) ? who : "?");
+    }
+}
+
+void idle_close_hold_leave(const char *who) {
+    pthread_mutex_lock(&g_idle_lock);
+    if (g_idle_hold > 0) {
+        g_idle_hold--;
+    }
+    int n = g_idle_hold;
+    g_idle_last_act_ms = idle_close_now_ms();   // 任务结束重新开始计 3 秒
+    pthread_mutex_unlock(&g_idle_lock);
+
+    if (n == 0) {
+        printf("[IDLE-CLOSE] ▶ 恢复空闲判定: %s 结束, 之后 %dms 无操作即关闭通道\n",
+               (who != NULL) ? who : "?", IDLE_CLOSE_TIMEOUT_MS);
+    }
+}
+
+// ---------- 对外接口 4: 若正在自动关闭, 等它做完 ----------
+// 只在 0x23(设通道) 与 0x1D(扫描) 开头调用。等待上限 IDLE_CLOSE_WAIT_MAX_MS,
+// 超时也继续(仅告警), 绝不把调用方永久卡住。
+void idle_close_wait_if_closing(const char *who) {
+    int waited = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_idle_lock);
+        int closing = g_idle_closing;
+        pthread_mutex_unlock(&g_idle_lock);
+
+        if (!closing) {
+            if (waited > 0) {
+                printf("[IDLE-CLOSE] ⏳ %s 已等到自动关闭结束(等了 %dms), 继续执行\n",
+                       (who != NULL) ? who : "?", waited);
+            }
+            return;
+        }
+        if (waited >= IDLE_CLOSE_WAIT_MAX_MS) {
+            printf("[IDLE-CLOSE] ⚠️ %s 等待自动关闭结束超时(%dms), 继续执行;"
+                   " 若本次无数据, 请核对是否与自动关闭撞车\n",
+                   (who != NULL) ? who : "?", waited);
+            return;
+        }
+        usleep(5 * 1000);
+        waited += 5;
+    }
+}
+
+// ---------- 看门狗线程 ----------
+static void *idle_close_worker(void *arg) {
+    (void)arg;
+    printf("[IDLE-CLOSE] ✅ 空闲看门狗已启动: %dms 无操作即关闭 0x00~0x0F 全部开关通道"
+           "(每 %dms 检查一次)\n", IDLE_CLOSE_TIMEOUT_MS, IDLE_CLOSE_POLL_MS);
+
+    for (;;) {
+        usleep(IDLE_CLOSE_POLL_MS * 1000);
+
+        long long now = idle_close_now_ms();
+
+        pthread_mutex_lock(&g_idle_lock);
+        if (g_idle_hold > 0) {
+            // 长任务期间: 基准一直推到"当前", 任务结束后才从 0 开始计 3 秒
+            g_idle_last_act_ms = now;
+        }
+        int        hold    = g_idle_hold;
+        long long  last    = g_idle_last_act_ms;
+        int        already = g_idle_closed;
+        pthread_mutex_unlock(&g_idle_lock);
+
+        if (hold > 0 || already) {
+            continue;                       // 长任务中 / 已经关过了 -> 什么都不做
+        }
+
+        long long idle = now - last;
+        if (idle < IDLE_CLOSE_TIMEOUT_MS) {
+            continue;                       // 还没到 3 秒
+        }
+
+        // 关闭前二次确认: 把"刚判定空闲、命令就到了"的窗口压到最小
+        pthread_mutex_lock(&g_idle_lock);
+        if (g_idle_hold > 0 || g_idle_closed ||
+            idle_close_now_ms() - g_idle_last_act_ms < IDLE_CLOSE_TIMEOUT_MS) {
+            pthread_mutex_unlock(&g_idle_lock);
+            continue;
+        }
+        // ★ 并发修正: 记下关闭起点, 关完后用它判断"关闭期间是否来了新命令"
+        long long close_t0 = idle_close_now_ms();
+        g_idle_closed  = 1;    // 先置位: 关闭本身耗时, 防止下一轮重复触发
+        g_idle_closing = 1;
+        pthread_mutex_unlock(&g_idle_lock);
+
+        // ===== 真正关闭: 两条路径都走, 与 0x25(Task_Disable_All_Switch) / 扫描收尾一致 =====
+        printf("[IDLE-CLOSE] ⏱ 已 %lldms 无任何操作(阈值 %dms), 开始关闭全部开关通道...\n",
+               idle, IDLE_CLOSE_TIMEOUT_MS);
+        int r1 = disable_all_switch_via_cpld();   // CPLD 广播: 0x00~0x0F 共 16 张卡, CH=0
+        int r2 = disable_all_switch();            // GPIO: PA11/PB0 拉低 + 补一帧 CPLD 0x00 0x00
+        int ok = (r1 == 0 || r2 == 0);
+
+        pthread_mutex_lock(&g_idle_lock);
+        g_idle_closing = 0;
+        // ★ 关闭期间(几十毫秒)若来过 0x23/0x1D, 这些命令已经把 g_idle_last_act_ms 推后了:
+        //   此时通道马上会被重新选中, 不能记"已关闭", 否则看门狗之后永远不会再关。
+        int activated = (g_idle_last_act_ms > close_t0);
+        if (activated) {
+            g_idle_closed = 0;                    // 交给下一轮空闲判定(3 秒后再关)
+            g_idle_retry  = 0;
+        } else if (ok) {
+            g_idle_retry  = 0;
+            g_idle_closed = 1;
+        } else if (++g_idle_retry < IDLE_CLOSE_RETRY_MAX) {
+            g_idle_closed = 0;                    // 保持"未关闭", 下一轮再试
+        } else {
+            g_idle_closed = 1;                    // 放弃重试(日志会写清楚)
+        }
+        int retry = g_idle_retry;
+        pthread_mutex_unlock(&g_idle_lock);
+
+        if (activated) {
+            printf("[IDLE-CLOSE] 🔁 关闭期间收到新命令, 本次不记“已关闭”; "
+                   "新命令结束后重新计 %dms\n", IDLE_CLOSE_TIMEOUT_MS);
+        } else if (ok) {
+            printf("[IDLE-CLOSE] ✅ 自动关闭完成(cpld_ret=%d, gpio_ret=%d); "
+                   "下次下发命令会重新选中通道\n", r1, r2);
+        } else {
+            printf("[IDLE-CLOSE] ❌ 自动关闭失败(cpld_ret=%d, gpio_ret=%d), 请检查 485/CPLD 与 GPIO;"
+                   " %s\n", r1, r2,
+                   (retry < IDLE_CLOSE_RETRY_MAX) ? "稍后自动重试" : "已达重试上限, 不再尝试");
+        }
+    }
+    return NULL;
+}
+
+// ---------- 对外接口 5: 启动看门狗(由 main.c 调用, 可重复调用) ----------
+int idle_close_start(void) {
+    if (g_idle_started) {
+        return 0;
+    }
+    g_idle_started = 1;
+
+    pthread_mutex_lock(&g_idle_lock);
+    g_idle_last_act_ms = idle_close_now_ms();
+    g_idle_closed      = 1;     // 开机没人操作过, 按"已关闭"算, 不白发 16 帧广播
+    g_idle_hold        = 0;
+    g_idle_closing     = 0;
+    pthread_mutex_unlock(&g_idle_lock);
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, idle_close_worker, NULL) != 0) {
+        printf("[IDLE-CLOSE] ❌ 看门狗线程创建失败, 本功能未启用\n");
+        g_idle_started = 0;
+        return -1;
+    }
+    pthread_detach(tid);
+    return 0;
 }
 
 // 注：回包缓冲已改为各任务函数内的局部变量（线程池并发执行时互不干扰），不再使用全局缓冲
@@ -291,18 +538,37 @@ DAC8562_Set_Output_A(data);
 }
 
 
+// ==================== 操作码 0x07: 单次读取高压电压(可由上位机反复轮询) ====================
+// 数据: 1 字节(内容不参与计算, 仅为长度校验); 应答 0x08 + 2 字节(raw, 大端)
+// [2026-11-05] 支持轮询:
+//   1) protocol.c 里 0x07 走专用轮询通道(不去重、不回放缓存), 每条命令都真实采样一次;
+//   2) 这里用 g_hv_read_lock 把并发到来的多条 0x07 串行化, 防止两条命令交错打断
+//      ADS1115 的"启动转换 -> 等待 -> 读结果"三步时序;
+//   3) 读取期间关掉 ADS1115 的逐条详细打印, 只保留本函数一行汇总 —— 轮询时每秒可能
+//      十几条命令, 每条 5~6 行日志会把串口/TCP 应答拖慢。
+//   单次读取耗时已从固定 100ms 降到 ~10ms(OS 位等待, 见 ads1115.c), 轮询周期 ≥20ms 即可稳定。
 void Task_Read_HV(void *arg) {
     command_t *task_arg = (command_t *)arg;
     if (task_arg->data) free(task_arg->data);
 
-    // 打印：任务开始
-    printf("[ReadHV] ▶ 任务开始: 读取高压电压\n");
+    pthread_mutex_lock(&g_hv_read_lock);
+    ADS1115_Set_Verbose(0);
+    uint16_t v = ADS1115_Read_ADC_U();
+    ADS1115_Set_Verbose(1);
+    pthread_mutex_unlock(&g_hv_read_lock);
 
-    // 读取 HV 电压 (ADS1115 通道)
-    U = ADS1115_Read_ADC_U();
-    // 打印：HV 电压值
-    printf("[ReadHV] ✅ 任务完成: 电压=%u\n", U);
-    task_reply_u16(task_arg, 0x08, U, "ReadHV");
+    U = v;
+
+    if (v == 0xFFFF) {
+        printf("[ReadHV] ❌ 读取失败: ADS1115 无有效数据\n");
+    } else {
+        int16_t raw   = (int16_t)v;
+        int32_t hv_mv = (int32_t)raw * 125 * 501 / 1000;   // 同 ADS1115_Read_ADC_U 的换算
+        printf("[ReadHV] ✅ 电压=%u (raw=%d, HV=%ld.%03ld V)\n",
+               v, raw, (long)(hv_mv / 1000), (long)labs(hv_mv % 1000));
+    }
+
+    task_reply_u16(task_arg, 0x08, v, "ReadHV");
     free(task_arg);
 }
 
@@ -391,6 +657,19 @@ void Task_Test_En(void *arg) {
     // fpgareset();
     atomic_store(&adc_stop_flag, 1);
 
+    // 上电时序与 0x13 的断电收尾互斥(见 g_hv_seq_lock 说明)
+    pthread_mutex_lock(&g_hv_seq_lock);
+
+    // [2026-11-05] 幂等: 已使能时重复的 0x11(上位机重发)不再重跑上电时序,
+    //   否则 START_HV_CHECK 里的 "0x05=0x00 撤销放电" 会让高压瞬断 50ms。
+    if (g_hv_enabled) {
+        pthread_mutex_unlock(&g_hv_seq_lock);
+        printf("[TestEn] 🔁 高压已处于使能状态, 本次只补应答(不重复上电时序)\n");
+        task_reply_u32(task_arg, 0x12, 0xFFFFFFFFu, "TestEn");
+        free(task_arg);
+        return;
+    }
+
     if (START_HV_CHECK() == 1) {
         printf("[TestEn] ✅ 高压就绪, 开始测试\n");
     } else {
@@ -398,6 +677,7 @@ void Task_Test_En(void *arg) {
         //   低字节=0x05), 便于从网口直接诊断"高压为什么没就绪"。
         //   先回包再打印: 串口输出受阻时, 排在 printf 后面的应答会发不出去。
         uint16_t st = FPGA_Read_State_Regs();
+        pthread_mutex_unlock(&g_hv_seq_lock);
         task_reply_u32(task_arg, 0x12, 0xFFFF0000u | (uint32_t)st, "TestEn");
         printf("[TestEn] ❌ 高压未就绪(0x04=0x%02X, 0x05=0x%02X), 测试无法开始\n",
                (unsigned)((st >> 8) & 0xFF), (unsigned)(st & 0xFF));
@@ -415,71 +695,25 @@ void Task_Test_En(void *arg) {
       
     mculdac();
     printf("[TestEn]   已触发 MCU-DAC, PD13 置高\n");
- 
+    g_hv_enabled = 1;        // 记录"已使能", 供后续重复 0x11 判重(0x13 清除)
+    pthread_mutex_unlock(&g_hv_seq_lock);   // 使能时序结束, 释放给 0x13 收尾
 
-    // 进入采样循环: 每 2s 读一次 I/U, 直到 HV_stop_flag 被置 1
-    printf("[TestEn]   开始 1/U 采样循环 (每 2s 一次, 等 HV_stop_flag=1 退出)\n");
+    // [2026-11-05] 移除"每 2s 读一次 I/U"的常驻采样循环。
+    //   原实现的问题:
+    //     1) 0x11 的 worker 线程永远卡在 while(1) 里, 操作码 0x11 一直处于 busy,
+    //        上位机若再发 0x11 会被判 0xF1(重复指令); 线程池也被长期占用一个 worker。
+    //     2) 不管上位机要不要, 板子自己每 2s 读一次 I/U 并刷日志 —— 与"上位机用
+    //        0x07 轮询读取高压"的流程冲突(两种读法抢同一个 ADS1115/总线)。
+    //   现在 0x11 只做"使能"这一件事:
+    //     START_HV_CHECK(撤销放电 + 0x05 bit0 使能高压 + HV_READY_CMD)
+    //     -> mculdac()(PD13 拉高, DAC8562 输出建立) -> 回 0x12 -> 立即返回。
+    //   电压读取由上位机反复发 0x07(Task_Read_HV: 单次读 U, 回 0x08) 自行控制节奏。
+    //   ⚠️ 关闭高压的收尾动作已移到 0x13(Task_Test_Stop), 保证"停止"仍然真正断电。
     uint32_t status = 0xFFFFFFFF;
-        task_reply_u32(task_arg, 0x12, status, "TestEn");
-   atomic_store(&HV_stop_flag, 0);
-int val = 0;
-while (1) {
-    // 每50ms检测一次
-    sleep(2);
-    ADS1115_Read_ADC_I();
-    ADS1115_Read_ADC_U();
-    // 检查停止信号
-    val = atomic_load(&HV_stop_flag);
-    if (val == 1) {
-        break;
-    }
-    
-    // // 读取高压状态
-    // uint8_t hv_state = Read_Info_State_Reg();
-    // if (hv_state == 0xFF) {
-    //     send_error_reply(task_arg, 0xF6, task_arg->opcode);
-    //     break;
-    // }
-    
-    // // bit5: 放电继电器 (必须为0)
-    // if (((hv_state >> 5) & 0x01) == 1) {
-    //     send_error_reply(task_arg, 0xF6, task_arg->opcode);
-    //     break;
-    // }
-    
-    // // bit4: 硬件故障锁存 (必须为0)
-    // if (((hv_state >> 4) & 0x01) == 1) {
-    //     send_error_reply(task_arg, 0xF6, task_arg->opcode);
-    //     break;
-    // }
-    
-    // // bit0: 高压使能 (必须为1)
-    // if (((hv_state >> 0) & 0x01) == 0) {
-    //     send_error_reply(task_arg, 0xF6, task_arg->opcode);
-    //     break;
-    // }
-    
-    // // 读取电压
-    // U = ADS1115_Read_ADC_U();
-    
-    // // 检查电压范围
-    // if (U > HV + HV / 5) {
-    //     send_error_reply(task_arg, 0xF4, task_arg->opcode);
-    //     break;
-    // } else if (U < HV - HV / 5) {
-    //     send_error_reply(task_arg, 0xF5, task_arg->opcode);
-    //     break;
-    // }
-}
-    HV = 0;
-    teststop();
-    atomic_store(&HV_stop_flag, 1);
-    atomic_store(&adc_stop_flag, 1);
-    DAC8562_Set_Output_A(0);
-    disable_all_switch();
-    Finish_HV();
-    mculdac0();
-    printf("[TestEn] ✅ 任务完成: 已关闭高压与全部开关, 采样循环已退出\n");
+    atomic_store(&HV_stop_flag, 0);          // 0 = 本次使能尚未被停止
+    task_reply_u32(task_arg, 0x12, status, "TestEn");
+    printf("[TestEn] ✅ 任务完成: 高压已使能(0x05 bit0=1, PD13 已拉高), "
+           "本任务不再本地轮询; 读取电压请发 0x07\n");
     free(task_arg);
 }
 
@@ -505,6 +739,24 @@ void Task_Test_Stop(void *arg) {
     //     fprintf(stderr, "[TestStop] failed\n");
     // }
     task_reply_u32(task_arg, 0x14, status, "TestStop");
+
+    // [2026-11-05] 承接原 0x11 采样循环退出时的"关闭高压与全部开关"收尾。
+    //   0x11 已不再常驻循环(见 Task_Test_En), 若这里不接管, 发 0x13 停止后高压会
+    //   一直保持输出 —— 属于安全隐患, 所以收尾必须同步执行。
+    //   顺序沿用原逻辑: 清目标电压 -> 关 FPGA 测试位 -> 关 DAC 输出 -> 关全部开关
+    //   -> Finish_HV(放电/关高压时序) -> PD13 拉低。
+    //   先回包再断电: 保持 0x14 应答时延与原实现一致; 断电动作随后在本 worker 线程内
+    //   同步完成, 与后续命令天然串行(不会和下一次 0x11 抢 I2C/485)。
+    pthread_mutex_lock(&g_hv_seq_lock);     // 等正在进行的 0x11 上电时序收尾, 再断电
+    g_hv_enabled = 0;        // 已停止, 允许下一次 0x11 重新走完整上电时序
+    HV = 0;
+    DAC8562_Set_Output_A(0);
+    teststop();
+    disable_all_switch();
+    Finish_HV();
+    mculdac0();
+    pthread_mutex_unlock(&g_hv_seq_lock);
+    printf("[TestStop] ✅ 收尾完成: 高压已关闭, 全部开关已断开(PD13 已拉低)\n");
     free(task_arg);
 }
 
@@ -946,6 +1198,12 @@ void Task_Set_Scan_Channels(void *arg) {
 
     // 打印：任务开始
     printf("[SetScanChannels] ▶ 任务开始: 设置扫描通道队列\n");
+
+    // [IDLE-CLOSE] 若此刻"3 秒无操作自动关通道"正在连发 16 帧, 先等它发完再设通道,
+    //   否则会出现"通道刚被选中、又被随后的关闭帧关掉"(扫描时该点无数据)。
+    //   注意: 0x23 在接收线程里同步执行, 所以这里的等待上限只有 IDLE_CLOSE_WAIT_MAX_MS(500ms),
+    //   关闭动作本身只要几十毫秒, 正常情况下几乎不会真的等。
+    idle_close_wait_if_closing("0x23 设通道");
 
     // 检查adc_stop_flag是否为1
     if (atomic_load(&adc_stop_flag) != 1) {
@@ -1533,6 +1791,16 @@ void Task_ADC_Auto_Scan(void *arg) {
     uint8_t echo[2];
     // 打印：任务开始
     printf("[AutoScan] ▶ 任务开始: 自动 ADC 扫描, 每通道采样=%d 次\n", Times_Read_ADC121);
+
+    // [IDLE-CLOSE] 同 0x23: 若"3 秒无操作自动关通道"正在关, 等它关完再开始扫描,
+    //   避免第一个通道刚切好就被剩余关闭帧关掉。0x1D 是线程池执行, 阻塞在这里无副作用。
+    idle_close_wait_if_closing("0x1D 扫描");
+
+    // [IDLE-CLOSE] 扫描一次要几秒到几十秒, 期间不会有新命令, 必须挂起空闲判定。
+    //   与函数末尾(reply 之前)的 idle_close_hold_leave 成对; 本函数没有中途 return,
+    //   若以后新增提前 return 的分支, 记得在 return 前也调一次 hold_leave。
+    idle_close_hold_enter("0x1D 扫描");
+
  atomic_store(&HV_stop_flag, 0);
 
     // [2026-10-23] 采集前必须先确保 PD14/PD15 为低: 上一次扫描结束时的 1 秒同步
@@ -1786,6 +2054,10 @@ void Task_ADC_Auto_Scan(void *arg) {
     //   ⚠️ 必须晚于脉冲处理: 先脉冲再关的话, 关断瞬态会被示波器拍进脉冲窗口;
     //      先关后脉冲, 整个脉冲窗口内硬件都已是静默状态。
     // scan_disable_all_switch(aborted ? "采集中断" : "正常扫描完成");
+
+    // [IDLE-CLOSE] 与函数开头的 idle_close_hold_enter 成对: 扫描结束, 恢复空闲判定
+    //   (只做一次加锁/改计数, 不会阻塞, 放在回包前不影响 0x1D 的忙窗口释放)。
+    idle_close_hold_leave("0x1D 扫描");
 
     task_reply_u32(task_arg, 0x1E, total_reads, "AutoScanDone");
 
