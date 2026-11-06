@@ -24,7 +24,7 @@ import struct
 import sys
 import time
 
-HOST = os.environ.get("DBG_HOST", "192.168.0.106")
+HOST = os.environ.get("DBG_HOST", "192.168.0.100")
 PORT = int(os.environ.get("DBG_PORT", "8080"))
 
 

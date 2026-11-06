@@ -665,7 +665,11 @@ void Task_Test_En(void *arg) {
     if (g_hv_enabled) {
         pthread_mutex_unlock(&g_hv_seq_lock);
         printf("[TestEn] 🔁 高压已处于使能状态, 本次只补应答(不重复上电时序)\n");
-        task_reply_u32(task_arg, 0x12, 0xFFFFFFFFu, "TestEn");
+        // [2026-11-06] 应答值改为 0: 协议文档第 8 节规定 0x12 成功=0x0000、失败=0xFFFF。
+        //   原来回 0xFFFFFFFF, 上位机按 16 位取值 = 0xFFFF, 于是每次都打印
+        //   "使能开始测试失败:65535" 并判 0x12 指令出错(靠"策略②忽略失败"才没中断测试),
+        //   真正的失败反而被这条假告警淹没。
+        task_reply_u32(task_arg, 0x12, 0u, "TestEn");
         free(task_arg);
         return;
     }
@@ -678,7 +682,10 @@ void Task_Test_En(void *arg) {
         //   先回包再打印: 串口输出受阻时, 排在 printf 后面的应答会发不出去。
         uint16_t st = FPGA_Read_State_Regs();
         pthread_mutex_unlock(&g_hv_seq_lock);
-        task_reply_u32(task_arg, 0x12, 0xFFFF0000u | (uint32_t)st, "TestEn");
+        // [2026-11-06] 失败时保证低 16 位非 0(协议文档: 失败=0xFFFF):
+        //   上位机按 16 位判 0=成功 / 非 0=失败, 若 st 恰好为 0 会变成 0xFFFF0000,
+        //   低 16 位=0 会被误判成功。st 非 0 时仍保留 0x04/0x05 现场值便于定位。
+        task_reply_u32(task_arg, 0x12, 0xFFFF0000u | (uint32_t)(st ? st : 0xFFFFu), "TestEn");
         printf("[TestEn] ❌ 高压未就绪(0x04=0x%02X, 0x05=0x%02X), 测试无法开始\n",
                (unsigned)((st >> 8) & 0xFF), (unsigned)(st & 0xFF));
         free(task_arg);
@@ -709,7 +716,9 @@ void Task_Test_En(void *arg) {
     //     -> mculdac()(PD13 拉高, DAC8562 输出建立) -> 回 0x12 -> 立即返回。
     //   电压读取由上位机反复发 0x07(Task_Read_HV: 单次读 U, 回 0x08) 自行控制节奏。
     //   ⚠️ 关闭高压的收尾动作已移到 0x13(Task_Test_Stop), 保证"停止"仍然真正断电。
-    uint32_t status = 0xFFFFFFFF;
+    // [2026-11-06] 0x12 成功应答值改为 0(协议文档第 8 节: 成功 0x0000 / 失败 0xFFFF)。
+    //   原为 0xFFFFFFFF, 上位机取 16 位得 0xFFFF -> 每批都报"使能开始测试失败:65535"。
+    uint32_t status = 0;
     atomic_store(&HV_stop_flag, 0);          // 0 = 本次使能尚未被停止
     task_reply_u32(task_arg, 0x12, status, "TestEn");
     printf("[TestEn] ✅ 任务完成: 高压已使能(0x05 bit0=1, PD13 已拉高), "
@@ -729,7 +738,9 @@ void Task_Test_Stop(void *arg) {
     atomic_store(&adc_stop_flag, 1);
     atomic_store(&HV_stop_flag, 1);
     // 停止测试: 清除 HV_Test 命令 (CMD1 bit3)
-    uint32_t status = 0xFFFFFFFF;
+    // [2026-11-06] 0x14 成功应答值改为 0(协议文档第 9 节: 成功 0x0000 / 失败 0xFFFF)。
+    //   原为 0xFFFFFFFF, 上位机取 16 位得 0xFFFF -> 每批结束都报"停止测试失败:65535"。
+    uint32_t status = 0;
     // if (HV_Test_En(0) == true) {
     //     // 打印：测试停止成功
     //     printf("[TestStop] stopped\n");
@@ -1483,7 +1494,21 @@ int task_rescue_broken_set_channels(command_t *cmd, const uint8_t *tail, int tai
 //2026-10-26    SCAN_SETTLE_DIFF_LSB:150 -> 30
 #define SCAN_SETTLE_DIFF_LSB     30    // 稳定判据: 相邻块均值差 < 150 LSB(≈14mV)
 //2026-10-26    SCAN_SETTLE_MAX_POINTS:350 -> 2400
-#define SCAN_SETTLE_MAX_POINTS   2400    // 丢弃上限(~2.0s), 超时强制进入正式采样
+#define SCAN_SETTLE_MAX_POINTS   2400    // 点数上限(仅作为兜底, 实际先到 SCAN_SETTLE_MAX_MS)
+// [2026-11-06 修复"偶发整点失败 + 后续 0xF7/0xF1/0xFFFFFFFF 连锁报错"]
+//   ★ 必须同时有"墙钟上限": 点数上限是死的, 单点耗时是活的。
+//   现场日志(log_debug.txt 14:22:22~14:22:29)实测: 某个通道迟迟不收敛, 弛豫一直丢到
+//   2400 点, 单点约 2.9~5.7ms -> 本次 0x1D 耗时 7s 以上, 而上位机单步超时只有 5s:
+//       上位机判"读ADC121电压 timed out(5000 ms)" -> 继续下一组
+//       下一组的 0x1B 撞上"扫描还没结束": 回 0xF7 (数据 0x1B00)
+//       下一组的 0x23 撞上 adc_stop_flag=0: 回 0xFFFFFFFF
+//       下一条 0x1D 撞上 0x1D 操作码仍忙: 回 0xF1 (数据 0x1D00)
+//       最后 0x13 停止也撞忙: 回 0xF1 (数据 0x1300) -> 现场看到"停止测试失败"
+//   => 一个通道不收敛, 会连锁报销后面 2 个测试点, 这就是"偶尔出现"的根因。
+//   现在改成"时间或点数, 先到先停": SCAN_SETTLE_MAX_MS 到期就强制进入正式采样。
+//   预算: 3.0s(弛豫) + 10 点采样 + 回包 ≈ 3.2s < 上位机 5s, 留足余量;
+//        正常已稳定的通道约 0.4s 就通过, 不受影响。
+#define SCAN_SETTLE_MAX_MS       3000    // ★ 弛豫丢弃的时间上限(ms), 与上位机 5s 超时配套
 
 // ==================== PD14/PD15 同步脉冲(异步执行) ====================
 // [2026-10-23 修复 连续多通道扫描丢包]
@@ -1930,7 +1955,21 @@ void Task_ADC_Auto_Scan(void *arg) {
         {
             uint32_t block_sum = 0, prev_avg = 0;
             int in_block = 0, blocks = 0, settled = 0, dropped = 0;
+            // [2026-11-06] 弛豫的墙钟起点: 到 SCAN_SETTLE_MAX_MS 强制结束(见宏处说明)
+            long long settle_t0 = task_now_us();
             while (dropped < SCAN_SETTLE_MAX_POINTS) {
+                // [2026-11-06] 被 0x21/0x13 中断时立刻退出弛豫, 别再白等 3 秒
+                if (atomic_load(&adc_stop_flag)) {
+                    printf("[AutoScan] ⚠️ 通道 %u: 弛豫期间被中断, 提前结束(已丢 %d 点)\n",
+                           ch_info.collect, dropped);
+                    break;
+                }
+                if (task_now_us() - settle_t0 > (long long)SCAN_SETTLE_MAX_MS * 1000LL) {
+                    printf("[AutoScan] ⚠️ 通道 %u: 弛豫达到时间上限 %dms(已丢 %d 点仍未稳定), "
+                           "强制开始正式采样(避免 0x1D 超过上位机 5s 超时)\n",
+                           ch_info.collect, SCAN_SETTLE_MAX_MS, dropped);
+                    break;
+                }
                 uint32_t v = ADS8691_Read();
                 dropped++;
 
@@ -1942,7 +1981,9 @@ void Task_ADC_Auto_Scan(void *arg) {
                 // if (v != 0xFFFFFFFF) (void)scan_filter_apply(v);
 
                 // [2026-10-16] 丢弃期进度打印: 每 50 点一行, 避免这段时间"像卡住"
-                if (dropped % 50 == 0) {
+                // [2026-11-06] 50 -> 200 点: 串口只有 11.5KB/s, 打印本身会拖长弛豫
+                //   (每行约 60 字节 ≈ 5ms), 2400 点打 48 行等于额外多耗 0.25s。
+                if (dropped % 200 == 0) {
                     printf("[AutoScan]   通道 %u: 弛豫中, 已丢 %d/%d 点, 最新 ADC=%u\n",
                            ch_info.collect, dropped, SCAN_SETTLE_MAX_POINTS, v);
                 }

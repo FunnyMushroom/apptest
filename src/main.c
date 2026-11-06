@@ -320,7 +320,7 @@ if (mq == (mqd_t)-1) {
         }
     }
     printf("[MAIN] ✅ 全部子系统初始化完成, 进入主循环\n");
-    printf("[MAIN] : 当前版本:app1105(测试版) 频率可调 3s没有操作自动关闭所有通道 编译时间: %s\n", BUILD_STAMP);
+    printf("[MAIN] : 当前版本:app1105(测试版_V1) 频率可调 3s没有操作自动关闭所有通道 编译时间: %s\n", BUILD_STAMP);
 
     // 主循环(等待退出信号)
     while (running)
