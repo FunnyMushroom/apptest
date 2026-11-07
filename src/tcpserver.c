@@ -406,14 +406,15 @@ static void *tcp_server_loop(void *arg)
         // 断线回收: TCP keepalive 探测到失联后, 该 socket 进入错误状态,
         // select 将其报告为可读, 上方 handle_client_data 中 recv 返回错误即走 close_client
 
-        // 解析超时检查: 卡住超过 PARSE_TIMEOUT_SEC 秒的解析器强制重置
+        // 解析超时检查: 卡住超过 PARSE_TIMEOUT_MS 毫秒的解析器重新同步
+        // [2026-11-02] 与 485 通道保持一致: 只丢到下一个 AB CD 处再继续, 不再整包清空
+        //   (重同步动作已内联在 protocol_parser_check_timeout 内完成)
         for (int i = 0; i < MAX_CLIENTS; ++i) {
             if (server->clients[i].fd != -1 &&
                 protocol_parser_check_timeout(&server->clients[i].parser)) {
-                printf("[TCP] ⚠️ 解析超时, 已重置解析器: fd=%d (%s:%d)\n",
+                printf("[TCP] ⚠️ 残帧超时, 重新同步解析器: fd=%d (%s:%d)\n",
                        server->clients[i].fd,
                        server->clients[i].ip, server->clients[i].port);
-                protocol_parser_init(&server->clients[i].parser);
             }
         }
     }

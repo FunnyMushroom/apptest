@@ -97,18 +97,19 @@ void cpld_deinit(void) {
     pthread_mutex_unlock(&g_mutex);
 }
 
-// ==================== 快速发送: 0xAA a b 0xED ====================
-// 只把 4 字节帧写进串口发送缓冲就返回, 不 tcflush/tcdrain、不等待回复。
-int cpld_send_hex_command_block(uint8_t a, uint8_t b) {
+// ==================== 快速发送: 0xAA a b freq 0xED ====================
+// 只把 5 字节帧写进串口发送缓冲就返回, 不 tcflush/tcdrain、不等待回复。
+// [2026-11-04] 与 app923 对齐: 频率并入选通道帧, 不再有独立的 4 字节帧。
+int cpld_send_hex_command_block(uint8_t a, uint8_t b, uint8_t freq) {
     if (!g_initialized || g_uart == NULL) {
         printf("[CPLD] ❌ 发送失败: 未初始化\n");
         return -1;
     }
 
-    uint8_t cmd[4] = { CPLD_FRAME_HEAD, a, b, CPLD_FRAME_TAIL };
+    uint8_t cmd[CPLD_FRAME_LEN] = { CPLD_FRAME_HEAD, a, b, freq, CPLD_FRAME_TAIL };
     int fd = g_uart->fd;
 
-    pthread_mutex_lock(&g_mutex);   // 仅保证 4 字节帧不被其它线程插队
+    pthread_mutex_lock(&g_mutex);   // 仅保证 5 字节帧不被其它线程插队
 
     // 确保非阻塞(即使别处改回阻塞模式也能快速返回)
     int flags = fcntl(fd, F_GETFL, 0);
@@ -130,13 +131,13 @@ int cpld_send_hex_command_block(uint8_t a, uint8_t b) {
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             if (++retry > 5) {          // 发送缓冲满: 不阻塞, 丢弃本帧
                 pthread_mutex_unlock(&g_mutex);
-                printf("[CPLD] ❌ 发送失败: 发送缓冲满, 丢弃帧 %02X %02X\n", a, b);
+                printf("[CPLD] ❌ 发送失败: 发送缓冲满, 丢弃帧 %02X %02X %02X\n", a, b, freq);
                 return -1;
             }
             usleep(100);                // 100us 让出 CPU, 不作长时间等待
             continue;
         }
-        printf("[CPLD] ❌ 发送失败: 帧 %02X %02X: %s\n", a, b, strerror(errno));
+        printf("[CPLD] ❌ 发送失败: 帧 %02X %02X %02X: %s\n", a, b, freq, strerror(errno));
         pthread_mutex_unlock(&g_mutex);
         return -1;
     }
@@ -201,30 +202,30 @@ int cpld_recv_two(uint8_t *buf) {
     return -1;   // 无数据: 静默返回, 由调用方重试
 }
 
-// ==================== 发送后阻塞等待应答: 0xAA a b 0xED -> 期望收回 a b ====================
-// 发送 4 字节帧后阻塞等待回复, 要求收到的 2 个字节依次等于发送的 a、b
-// (即 buf[0] == a && buf[1] == b)才判定成功。
+// ==================== 发送后阻塞等待应答: 0xAA a b freq 0xED -> 期望收回 a b ====================
+// 发送 5 字节帧后阻塞等待回复, 要求收到的 2 个字节依次等于发送的 a、b
+// (即 buf[0] == a && buf[1] == b)才判定成功; 回包不含 freq, 故不参与匹配。
 //   - 日志同时打印“期望字节”和“实际收到字节”, 便于排查;
 //   - 每次等待上限 10ms: 10ms 内没收到匹配的 2 字节即视为本次失败, 立即重发;
 //   - 最多重发 3 次(即最多合计发送 4 次);
 //   - 只收到 1 个字节、或 2 个字节不匹配, 都丢弃并重发。
 // echo: 可为 NULL; 成功时写入收到的 2 字节(echo[0] == a, echo[1] == b)
 // 返回: 0 = 成功; -1 = 未初始化/发送失败; -2 = 重发耗尽仍未收到有效应答
-int cpld_send_hex_command_wait_reply(uint8_t a, uint8_t b, uint8_t *echo)
+int cpld_send_hex_command_wait_reply(uint8_t a, uint8_t b, uint8_t freq, uint8_t *echo)
 {
     if (!g_initialized || g_uart == NULL) {
         printf("[CPLD] ❌ 发送并等待应答失败: 未初始化\n");
         return -1;
     }
 
-    uint8_t cmd[4] = { CPLD_FRAME_HEAD, a, b, CPLD_FRAME_TAIL };
+    uint8_t cmd[CPLD_FRAME_LEN] = { CPLD_FRAME_HEAD, a, b, freq, CPLD_FRAME_TAIL };
     int fd = g_uart->fd;
 
     const int  max_resend = 3;      // 最多重发 3 次
     const long wait_us    = 10000;   // 每次等待 10ms
 
-    printf("[CPLD] ▶ 发送并等待应答开始: 期望 [%02X %02X], 最多重发 %d 次\n",
-           a, b, max_resend);
+    printf("[CPLD] ▶ 发送并等待应答开始: 期望 [%02X %02X], freq=%02X, 最多重发 %d 次\n",
+           a, b, freq, max_resend);
 
     pthread_mutex_lock(&g_mutex);
 
@@ -260,13 +261,13 @@ int cpld_send_hex_command_wait_reply(uint8_t a, uint8_t b, uint8_t *echo)
                 usleep(100);
                 continue;
             }
-            printf("[CPLD] ❌ 发送失败: 帧 %02X %02X: %s\n", a, b, strerror(errno));
+            printf("[CPLD] ❌ 发送失败: 帧 %02X %02X %02X: %s\n", a, b, freq, strerror(errno));
             write_failed = 1;
             break;
         }
         if (write_failed) {
             pthread_mutex_unlock(&g_mutex);
-            printf("[CPLD] ❌ 发送失败: 发送缓冲满, 丢弃帧 %02X %02X\n", a, b);
+            printf("[CPLD] ❌ 发送失败: 发送缓冲满, 丢弃帧 %02X %02X %02X\n", a, b, freq);
             return -1;
         }
 

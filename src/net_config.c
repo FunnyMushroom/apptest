@@ -9,7 +9,9 @@
  * 较老的 glibc 工具链（如 NUC980 交叉编译环境）中，struct ifreq / struct rtentry
  * 的完整定义受 __USE_MISC 保护，需 _GNU_SOURCE 才会暴露出来，
  * 否则会报 “不允许使用不完整的类型 struct ifreq”。 */
+#if !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
+#endif
 
 #include "net_config.h"
 

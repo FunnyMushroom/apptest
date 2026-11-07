@@ -31,6 +31,14 @@
 static i2c_t *g_i2c = NULL;
 static pthread_mutex_t g_i2c_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// [2026-11-05] 逐条详细打印开关: 0x07 轮询(每秒可能十几次)时由 Task_Read_HV 关掉,
+// 只保留它自己那一行汇总, 避免刷屏拖慢串口/TCP 的应答; 其它调用点默认仍打印。
+static int g_verbose = 1;
+
+void ADS1115_Set_Verbose(int on) {
+    g_verbose = (on != 0) ? 1 : 0;
+}
+
 // 获取全局句柄（懒加载，只打开一次，不关闭）
 static i2c_t *ads1115_i2c_get(void) {
     if (g_i2c != NULL && g_i2c->is_open) {
@@ -163,7 +171,9 @@ static int ads1115_read_channel_locked(i2c_t *h, uint16_t mux, uint16_t pga, uin
         printf("[ADS1115] ❌ 写配置失败: mux=0x%04X, cfg=0x%04X\n", mux, cfg);
         return -1;
     }
-    printf("[ADS1115]   已启动转换: mux=0x%04X, cfg=0x%04X\n", mux, cfg);
+    if (g_verbose) {
+        printf("[ADS1115]   已启动转换: mux=0x%04X, cfg=0x%04X\n", mux, cfg);
+    }
 
     // 2) 回读配置, 确认 MUX 位真的写进去了。
     //    若不校验: I2C 写失败时器件仍停留在上一个通道, 表现就是"通道0和通道1读到同一个值"。
@@ -177,8 +187,30 @@ static int ads1115_read_channel_locked(i2c_t *h, uint16_t mux, uint16_t pga, uin
         printf("[ADS1115] ⚠️ 配置寄存器回读失败, 无法校验 MUX\n");
     }
 
-    // 3) 启动转换后固定延时 100ms, 等待本次转换完成后再读取结果
-    usleep(100 * 1000);
+    // 3) 等本次转换完成。
+    //    旧实现固定 usleep(100ms): 单次读取就要 100ms, 0x07 轮询只能做到 ~9Hz,
+    //    上位机把周期压到 100ms 以内就会堆积/超时。
+    //    现改为读配置寄存器的 OS 位(bit15): 转换中 OS=0, 转换完成回到掉电态 OS=1。
+    //    128SPS 下单次转换约 7.8ms, 所以先固定等 3ms(确保器件已进入转换, 不会读到上一次的 OS=1),
+    //    再每 1ms 查一次, 实测总耗时 ~9~10ms, 比原来快 10 倍。
+    //    上限仍保留 120ms(原固定 100ms + 余量): 万一 OS 位一直不翻转, 按超时继续读结果,
+    //    行为与旧实现一致, 不会把一次偶发异常变成读失败。
+    usleep(3 * 1000);
+    for (int waited_ms = 0; ; waited_ms++) {
+        uint8_t c[2] = { 0, 0 };
+        if (i2c_read_bytes(h, 0x01, c, 2) != 0) {
+            break;      // I2C 出错: 不再等, 直接按超时处理(下面读结果会报错)
+        }
+        uint16_t cfg_now = (uint16_t)((c[0] << 8) | c[1]);
+        if (cfg_now & 0x8000) {
+            break;      // OS=1: 转换完成
+        }
+        if (waited_ms >= 120) {
+            printf("[ADS1115] ⚠️ 等待转换完成超时(>120ms), 按当前结果读取\n");
+            break;
+        }
+        usleep(1000);
+    }
 
     // 4) 读转换结果(高字节在前, 有符号数按 uint16 原样返回)
     if (i2c_read_bytes(h, 0x00, r, 2) != 0) {
@@ -187,7 +219,9 @@ static int ads1115_read_channel_locked(i2c_t *h, uint16_t mux, uint16_t pga, uin
     }
 
     *value = (uint16_t)((r[0] << 8) | r[1]);
-    printf("[ADS1115]   mux=0x%04X 采样值 = %u (0x%04X)\n", mux, *value, *value);
+    if (g_verbose) {
+        printf("[ADS1115]   mux=0x%04X 采样值 = %u (0x%04X)\n", mux, *value, *value);
+    }
     return 0;
 }
 
@@ -196,7 +230,9 @@ static int ads1115_read_channel_locked(i2c_t *h, uint16_t mux, uint16_t pga, uin
 //   pga: 0x0200(±4.096V) 等
 int ADS1115_Read_Channel(uint16_t mux, uint16_t pga, uint16_t *value)
 {
-    printf("[ADS1115] ▶ 读通道开始: mux=0x%04X, pga=0x%04X\n", mux, pga);
+    if (g_verbose) {
+        printf("[ADS1115] ▶ 读通道开始: mux=0x%04X, pga=0x%04X\n", mux, pga);
+    }
 
     i2c_t *h = ads1115_i2c_lock();
     if (h == NULL) {
@@ -248,10 +284,12 @@ uint16_t ADS1115_Read_ADC_U(void)
     int32_t hv_uv = uv * 501;              // HV = 引脚电压 × 501（与 DAC 一致）
     int32_t hv_mv = hv_uv / 1000;          // HV mV
 
-    printf("[ADS1115_U] ✅ 通道1(AIN1)电压: raw=%d, 引脚=%ld.%03ld mV, HV=%ld.%03ld V\n",
-           raw,
-           (long)(uv / 1000), (long)labs(uv % 1000),
-           (long)(hv_mv / 1000), (long)labs(hv_mv % 1000));
+    if (g_verbose) {
+        printf("[ADS1115_U] ✅ 通道1(AIN1)电压: raw=%d, 引脚=%ld.%03ld mV, HV=%ld.%03ld V\n",
+               raw,
+               (long)(uv / 1000), (long)labs(uv % 1000),
+               (long)(hv_mv / 1000), (long)labs(hv_mv % 1000));
+    }
     return v;
 }
 

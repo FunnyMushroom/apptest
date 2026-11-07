@@ -63,6 +63,9 @@ int  ADS1115_Init(void);
 void ADS1115_Close(void);
 
 // ---- 通道读取 ----
+// [2026-11-05] 逐条详细打印开关(1=开, 0=关): 0x07 高频轮询时由 Task_Read_HV 关掉,
+//   避免每条命令 5~6 行日志刷屏拖慢应答; 其它调用点不受影响(默认开)
+void ADS1115_Set_Verbose(int on);
 // 读任意通道(自动加锁); 返回 0 成功, -1 失败(此时 *value = 0xFFFF)
 int      ADS1115_Read_Channel(uint16_t mux, uint16_t pga, uint16_t *value);
 // 通道0 = I
