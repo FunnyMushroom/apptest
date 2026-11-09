@@ -1254,9 +1254,11 @@ static void set_scan_send_fpga_now(uint16_t switch_num, uint8_t freq) {
     split_num(switch_num, &f_card, &f_ch);
     int ret = cpld_send_hex_command_wait_reply(f_card, f_ch, freq, f_echo);
     if (ret == 0) {
-        printf("[SetScanChannels] ✅ FPGA 帧已立即下发: AA %02X %02X %02X ED, 回显 %02X %02X"
-               " (频率系数=%u, =%u kHz)\n",
-               f_card, f_ch, freq, f_echo[0], f_echo[1], freq, freq * 10u);
+        // [2026-11-09] 标明字段含义: f_card=开关卡卡号, f_ch=CPLD 通道(1基, =界面通道+1)
+        printf("[SetScanChannels] ✅ 开关卡帧已立即下发: AA %02X %02X %02X ED, 回显 %02X %02X"
+               " (开关卡%u/CPLD通道%u, 频率系数=%u, =%u kHz)\n",
+               f_card, f_ch, freq, f_echo[0], f_echo[1],
+               (unsigned)f_card, (unsigned)f_ch, freq, freq * 10u);
     } else {
         printf("[SetScanChannels] ❌ FPGA 帧立即下发失败(ret=%d): AA %02X %02X %02X ED, "
                "通道仍保留在队列中(0x1D 会重试)\n",
@@ -1395,9 +1397,14 @@ void Task_Set_Scan_Channels(void *arg) {
     uint32_t echo_len = (task_arg->data_len >= 7) ? 7u
                       : (task_arg->data_len >= 6) ? 6u : 5u;
 
-    printf("[SetScanChannels]   收到通道: collect=%u, switch=%u, freq=0x%02X(%u = %ukHz), "
+    // [2026-11-09] 打印拆解后的实际卡号/通道(合成号只是编号, 现场核对映射表需要实际值):
+    //   采集卡合成号 = 卡号×40+通道 -> 卡号=/40, 通道=%40; 开关卡合成号 = 卡号×128+通道(0基)。
+    printf("[SetScanChannels]   收到通道: 采集卡%u/通道%u (collect=%u), "
+           "开关卡%u/通道%u (switch=%u), freq=0x%02X(%u = %ukHz), "
            "一列采集通道数=%u, 步长=%u\n",
-           collect_ch, switch_ch, freq, freq, freq * 10, (unsigned)n_collect, (unsigned)step);
+           (unsigned)(collect_ch / 40u), (unsigned)(collect_ch % 40u), collect_ch,
+           (unsigned)(switch_ch / 128u), (unsigned)(switch_ch % 128u), switch_ch,
+           freq, freq, freq * 10, (unsigned)n_collect, (unsigned)step);
 
     pthread_mutex_lock(&g_scan_queue_lock);
 
@@ -1461,11 +1468,15 @@ void Task_Set_Scan_Channels(void *arg) {
             uint32_t eff = (uint32_t)collect_ch + g_repeat_count;   // 第2条->+1, 第3条->+2, ...
             if (eff < SCAN_COLLECT_MAX) {
                 printf("[SetScanChannels] 🔁 [重复递增#%u] 与最近一条原始请求完全相同"
-                       "(collect=%u, switch=%u, freq=0x%02X), 判定为同一开关通道列的第 %u 个测试点: "
-                       "生效采集通道 = %u + %u -> %u (开关通道/频率不变)\n",
-                       (unsigned)g_repeat_count, collect_ch, switch_ch, freq,
-                       (unsigned)(g_repeat_count + 1u), collect_ch,
-                       (unsigned)g_repeat_count, (unsigned)eff);
+                       "(采集卡%u/通道%u (collect=%u), 开关卡%u/通道%u (switch=%u), freq=0x%02X), "
+                       "判定为同一开关通道列的第 %u 个测试点: "
+                       "生效采集通道 = 采集卡%u/通道%u (collect %u + %u -> %u) (开关通道/频率不变)\n",
+                       (unsigned)g_repeat_count,
+                       (unsigned)(collect_ch / 40u), (unsigned)(collect_ch % 40u), collect_ch,
+                       (unsigned)(switch_ch / 128u), (unsigned)(switch_ch % 128u), switch_ch, freq,
+                       (unsigned)(g_repeat_count + 1u),
+                       (unsigned)(eff / 40u), (unsigned)(eff % 40u),
+                       collect_ch, (unsigned)g_repeat_count, (unsigned)eff);
                 collect_ch = (uint16_t)eff;
                 echo_buf[0] = (uint8_t)(collect_ch >> 8);   // 回包回显"实际生效"的通道对
                 echo_buf[1] = (uint8_t)(collect_ch & 0xFF);
