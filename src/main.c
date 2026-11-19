@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <pthread.h>
 #include "tcpserver.h"
 #include "threadpool.h"
 #include "dac8562.h"
@@ -43,6 +44,19 @@ static void signal_handler(int sig)
 {
     (void)sig;
     running = 0;
+}
+
+// 首次 I/U 读取后台线程: i2c-0(ADS1115, CN4→高压板)链路信号边缘状态,
+// 即使已有 50ms 快速失败, 同步首读也可能累计数百 ms~秒级, 放后台避免拖慢
+// 主初始化 → 保证 ota_mark_ok 在 OTA 120s 看门狗内执行, 不误触发回滚
+static void *iu_first_read_thread(void *arg)
+{
+    (void)arg;
+    printf("[MAIN] [IU线程] 后台读取一次 I/U 现场值\n");
+    ADS1115_Read_ADC_I();
+    ADS1115_Read_ADC_U();
+    printf("[MAIN] [IU线程] 首次 I/U 读取完成\n");
+    return NULL;
 }
 
 
@@ -144,9 +158,18 @@ int main(void)
     printf("[MAIN]   步骤: 高压收尾 (关闭高压与开关)\n");
     Finish_HV();
 
-    printf("[MAIN]   步骤: 读取一次 I/U 现场值\n");
-    ADS1115_Read_ADC_I();
-    ADS1115_Read_ADC_U();
+    printf("[MAIN]   步骤: 读取一次 I/U 现场值 (后台线程, 不阻塞初始化)\n");
+    {
+        pthread_t iu_tid;
+        if (pthread_create(&iu_tid, NULL, iu_first_read_thread, NULL) == 0) {
+            pthread_detach(iu_tid);
+        } else {
+            // 线程创建失败(极端情况), 退回同步执行保底
+            printf("[MAIN] ⚠️ IU线程创建失败, 退回同步读取\n");
+            ADS1115_Read_ADC_I();
+            ADS1115_Read_ADC_U();
+        }
+    }
 //  const uint16_t seq[] = { 0, 2000, 4000, 6000, 8000, 10000,12000,14000,16000,18000,20000 };
 // const unsigned seq_len = sizeof(seq) / sizeof(seq[0]);
 
@@ -320,7 +343,7 @@ if (mq == (mqd_t)-1) {
         }
     }
     printf("[MAIN] ✅ 全部子系统初始化完成, 进入主循环\n");
-    printf("[MAIN] : 当前版本:app1105(测试版_V1) 频率可调 3s没有操作自动关闭所有通道 编译时间: %s\n", BUILD_STAMP);
+    printf("[MAIN] : 当前版本:app1113(测试版bate_V3) 对0x05控制寄存器的值进行了打印 编译时间: %s\n", BUILD_STAMP);
 
     // 主循环(等待退出信号)
     while (running)

@@ -881,6 +881,100 @@ bool MCU_Test_En(uint8_t num) {
     return true;
 }
 
+// ==================== [2026-11-13 增益链路排查] 控制寄存器快照打印 ====================
+// PCB 拓扑(已从 主控板.NET / 采集卡.NET 网表核对):
+//   0x05 控制寄存器1 -> bit7-4: FPGA_16_CRT1~4(U4-98/97/96/95) -> U23 电平转换 -> Mux16_1_CRT1~4
+//                       -> 背板 U30-25~28 -> 采集卡 KA1~KA4 -> 3 片 DG406(U1/U2/U3) 的 A0~A3(16选1)
+//                       bit3-2: FPGA_4_CRT1~2(U4-99/100) -> U10 电平转换 -> Mux4_1_CRT1/2
+//                       -> 背板 U30-24/23 -> 采集卡 KA5/KA6 -> HC238(U7) -> DG406 的 EN_0~EN_2(3选1)
+//                       ★ 采集卡连接器(U9)上 KA1~KA6 与背板 Mux16/Mux4 的对应关系为按位宽+功能推定,
+//                         背板网表不在本工程内, 若现场对不上请以背板原理图为准。
+//   0x07 控制寄存器3 -> bit3-0 -> 采集卡 IN1~IN4(U9-b11~b14) -> DG412(U5) 的 IN1~IN4
+//                       -> 选通 4 个反馈电阻 R7(1K)/R10(3K)/R11(5K)/R8(7K) -> 改变 OPA2810(U6) 放大倍数
+//   结论: 通道选择(0x05)与增益(0x07)在 PCB 上是两组互不相干的走线, 写 0x07 不应改动 0x05;
+//         若日志里真的变了, 问题在 FPGA 固件的寄存器解码或本工程里其它对 0x05 的写操作。
+// 下面这几个函数就是把 0x05 在写前后各读一次并逐位打印, 现场据此定性。
+
+// 0x07 低 4 位取值 -> 实际倍数(映射与 FPGA_Set_Buff 里实测固化的档位一致)
+static const char *gain_code_desc(uint8_t code)
+{
+    switch (code & 0x0F) {
+        case 0x04: return "2 倍";
+        case 0x08: return "4 倍";
+        case 0x01: return "6 倍";
+        case 0x02: return "8 倍";
+        case 0x00: return "无增益选中(0x00)";
+        default:   return "未定义编码";
+    }
+}
+
+// 打印 0x05 的逐位含义(采集卡通道 / 芯片使能 / 放电 / 高压使能)
+static void gain_print_cmd1_bits(const char *tag, uint8_t v)
+{
+    // 控制寄存器1 位定义:
+    //   bit7~4: FPGA_16_CRT4~CRT1  信号采集卡信号切换控制(16选1)
+    //   bit3~2: FPGA_4_CRT2~CRT1   信号采集卡芯片使能控制(3选1)
+    //   bit1  : MCU_DISCHARGE_CMD  MCU主动请求放电
+    //   bit0  : HV_ENABLE          高压使能
+    printf("[GainCheck]     %s: 0x%02X -> "
+           "bit7~4 FPGA_16_CRT4~CRT1=%u%u%u%u (16选1=%u), "
+           "bit3~2 FPGA_4_CRT2~CRT1=%u%u (芯片使能=%u), "
+           "bit1 MCU_DISCHARGE_CMD=%u, bit0 HV_ENABLE=%u\n",
+           tag, v,
+           (unsigned)((v >> 7) & 0x01), (unsigned)((v >> 6) & 0x01),
+           (unsigned)((v >> 5) & 0x01), (unsigned)((v >> 4) & 0x01),
+           (unsigned)((v >> 4) & 0x0F),
+           (unsigned)((v >> 3) & 0x01), (unsigned)((v >> 2) & 0x01),
+           (unsigned)((v >> 2) & 0x03),
+           (unsigned)((v >> 1) & 0x01),
+           (unsigned)(v & 0x01));
+}
+
+// 打印 0x04~0x07 快照; ok[i]/reg[i] 的下标 0~3 分别对应 0x04/0x05/0x06/0x07
+static void gain_print_snapshot(const char *tag, const int ok[4], const uint8_t reg[4])
+{
+    printf("[GainCheck] ────── 控制寄存器快照: %s ──────\n", tag);
+
+    if (ok[0]) printf("[GainCheck]   [0x04] 高压板状态   = 0x%02X\n", reg[0]);
+    else       printf("[GainCheck]   [0x04] 高压板状态   = 读取失败\n");
+
+    if (ok[1]) {
+        printf("[GainCheck]   [0x05] 控制寄存器1 = 0x%02X"
+               "  (bit7~4 FPGA_16_CRT4~CRT1=%u%u%u%u (16选1=%u), "
+               "bit3~2 FPGA_4_CRT2~CRT1=%u%u (芯片使能=%u), "
+               "bit1 MCU_DISCHARGE_CMD=%u, bit0 HV_ENABLE=%u)\n",
+               reg[1],
+               (unsigned)((reg[1] >> 7) & 0x01), (unsigned)((reg[1] >> 6) & 0x01),
+               (unsigned)((reg[1] >> 5) & 0x01), (unsigned)((reg[1] >> 4) & 0x01),
+               (unsigned)((reg[1] >> 4) & 0x0F),
+               (unsigned)((reg[1] >> 3) & 0x01), (unsigned)((reg[1] >> 2) & 0x01),
+               (unsigned)((reg[1] >> 2) & 0x03),
+               (unsigned)((reg[1] >> 1) & 0x01),
+               (unsigned)(reg[1] & 0x01));
+    } else {
+        printf("[GainCheck]   [0x05] 控制寄存器1 = 读取失败\n");
+    }
+
+    if (ok[2]) {
+        printf("[GainCheck]   [0x06] 控制寄存器2 = 0x%02X"
+               "  (bit6-3 DG406通道=%u, bit2 FPGA_EN=%u, bit1 HV_READY_CMD=%u, bit0 FAULT_RESET_CMD=%u)\n",
+               reg[2],
+               (unsigned)((reg[2] >> 3) & 0x0F),
+               (unsigned)((reg[2] >> 2) & 0x01),
+               (unsigned)((reg[2] >> 1) & 0x01),
+               (unsigned)(reg[2] & 0x01));
+    } else {
+        printf("[GainCheck]   [0x06] 控制寄存器2 = 读取失败\n");
+    }
+
+    if (ok[3]) {
+        printf("[GainCheck]   [0x07] 控制寄存器3 = 0x%02X  (bit3-0 增益编码=0x%X -> %s)\n",
+               reg[3], (unsigned)(reg[3] & 0x0F), gain_code_desc(reg[3]));
+    } else {
+        printf("[GainCheck]   [0x07] 控制寄存器3 = 读取失败\n");
+    }
+}
+
 uint8_t FPGA_Set_Buff(uint8_t num){
 
   if (num != 2 && num != 4 && num != 6 && num != 8) {
@@ -929,12 +1023,74 @@ uint8_t FPGA_Set_Buff(uint8_t num){
             break;
     }
 
-    if (fpga_write_byte(fpga1, 0x07, val) != 0) {
+    // ==================== [2026-11-13 增益链路排查] 写 0x07 前后对比 0x05 ====================
+    // 排查目标: 使用增益指令(改控制寄存器3 = 0x07)时, 控制寄存器1(0x05, 采集卡通道/芯片使能/
+    //   高压使能)会不会被连带改动。若 0x05 变了, 之前选中的采集通道就丢了, 现象是"改完增益
+    //   电压跳到别的通道/通道错位"。
+    // 做法: 全程持同一把 I2C 锁, 先读 -> 写 0x07 -> 立刻回读, 避免扫描线程中途改 0x05 造成误判;
+    //   同时回读 0x07 与写入值比对, 区分"写入没生效"和"生效但连带改了 0x05"。
+    // 判据看日志里 [GainCheck] ✅/⚠️ 那一行即可。
+    {
+        int     ok_before[4]  = { 0, 0, 0, 0 };
+        uint8_t reg_before[4] = { 0, 0, 0, 0 };
+        int     ok_after[4]   = { 0, 0, 0, 0 };
+        uint8_t reg_after[4]  = { 0, 0, 0, 0 };
+
+        // ① 写之前: 读 0x04 / 0x05 / 0x06 / 0x07
+        ok_before[0] = (i2c_read_byte(fpga1, 0x04, &reg_before[0]) == 0);
+        ok_before[1] = (i2c_read_byte(fpga1, 0x05, &reg_before[1]) == 0);
+        ok_before[2] = (i2c_read_byte(fpga1, 0x06, &reg_before[2]) == 0);
+        ok_before[3] = (i2c_read_byte(fpga1, 0x07, &reg_before[3]) == 0);
+        gain_print_snapshot("写 0x07 之前", ok_before, reg_before);
+
+        // ② 写 0x07(控制寄存器3 = 增益)
+        if (fpga_write_byte(fpga1, 0x07, val) != 0) {
+            fpga_i2c_unlock();
+            printf("[FPGA_Set_Buff] ❌ 设置失败: 写寄存器 0x07=0x%02X 出错\n", val);
+            return 0xff;
+        }
+
+        // ③ 写之后立刻回读(仍在同一把锁内)
+        ok_after[0] = (i2c_read_byte(fpga1, 0x04, &reg_after[0]) == 0);
+        ok_after[1] = (i2c_read_byte(fpga1, 0x05, &reg_after[1]) == 0);
+        ok_after[2] = (i2c_read_byte(fpga1, 0x06, &reg_after[2]) == 0);
+        ok_after[3] = (i2c_read_byte(fpga1, 0x07, &reg_after[3]) == 0);
         fpga_i2c_unlock();
-        printf("[FPGA_Set_Buff] ❌ 设置失败: 写寄存器 0x07=0x%02X 出错\n", val);
-        return 0xff;
+
+        gain_print_snapshot("写完 0x07 之后", ok_after, reg_after);
+
+        // ④ 结论一: 0x05 是否被这次增益写入改变
+        if (ok_before[1] && ok_after[1]) {
+            if (reg_before[1] == reg_after[1]) {
+                printf("[GainCheck] ✅ 0x05 未变化: 0x%02X -> 0x%02X (写 0x07 不影响采集卡通道选择)\n",
+                       reg_before[1], reg_after[1]);
+            } else {
+                printf("[GainCheck] ⚠️ 0x05 被改变: 0x%02X -> 0x%02X, 变化位=0x%02X\n",
+                       reg_before[1], reg_after[1],
+                       (unsigned)(reg_before[1] ^ reg_after[1]));
+                gain_print_cmd1_bits("写前", reg_before[1]);
+                gain_print_cmd1_bits("写后", reg_after[1]);
+            }
+        } else {
+            printf("[GainCheck] ⚠️ 0x05 读取失败(写前=%s, 写后=%s), 无法比较\n",
+                   ok_before[1] ? "成功" : "失败",
+                   ok_after[1] ? "成功" : "失败");
+        }
+
+        // ⑤ 结论二: 0x07 回读是否等于写入值
+        if (ok_after[3]) {
+            if (reg_after[3] == val) {
+                printf("[GainCheck] ✅ 0x07 写入生效: 写入 0x%02X, 回读 0x%02X (%s)\n",
+                       val, reg_after[3], gain_code_desc(reg_after[3]));
+            } else {
+                printf("[GainCheck] ⚠️ 0x07 回读不一致: 写入 0x%02X, 回读 0x%02X (写前 0x%02X)\n",
+                       val, reg_after[3],
+                       ok_before[3] ? reg_before[3] : 0xFF);
+            }
+        } else {
+            printf("[GainCheck] ⚠️ 0x07 回读失败, 无法确认增益是否写入\n");
+        }
     }
-    fpga_i2c_unlock();
 
     printf("[FPGA_Set_Buff] ✅ 设置完成: 缓冲增益=%s, 已写 0x07=0x%02X\n", desc, val);
     return num;

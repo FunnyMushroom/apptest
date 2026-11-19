@@ -48,8 +48,16 @@ i2c_t *i2c_init(const char *device, int addr) {
         return NULL;
     }
 
+    // 快速失败模式: 内核层不重试, 单次超时50ms(内核单位10ms)
+    // 背景: i2c-0(ADS1115, CN4→高压板)链路信号边缘状态, 内核默认重试会导致单次失败卡5~8秒
+    // 50ms余量充足: FPGA(i2c-1)单次操作实测约21ms, 正常器件不受影响
+    unsigned long retries = 0;
+    ioctl(i2c->fd, I2C_RETRIES, &retries);
+    unsigned long timeout = 5;  // 5 × 10ms = 50ms
+    ioctl(i2c->fd, I2C_TIMEOUT, &timeout);
+
     i2c->is_open = true;
-    printf("[I2C] ✅ 初始化完成: %s, 从机地址=0x%02X, fd=%d\n",
+    printf("[I2C] ✅ 初始化完成: %s, 从机地址=0x%02X, fd=%d (快速失败: retries=0, timeout=50ms)\n",
            device, addr, i2c->fd);
     return i2c;
 }
